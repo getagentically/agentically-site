@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agentically — Your Business, Staffed by AI Operators</title>
+<meta name="description" content="Agentically gives you a team of named AI operators with real roles — marketing, ops, client work, research — in one command center you talk to. It acts. You approve.">
+<link rel="canonical" href="https://getagentically.com/">
+<meta property="og:title" content="Agentically — AI Operators for Your Business">
+<meta property="og:description" content="Named AI operators with real roles, running in one command center you talk to. It acts. You approve.">
+<meta property="og:url" content="https://getagentically.com/">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Agentically","alternateName":"getagentically","url":"https://getagentically.com/","applicationCategory":"BusinessApplication","operatingSystem":"Web, Windows, macOS","description":"Agentically gives businesses and individuals a team of named AI operators with defined roles, persistent memory, voice, and an approval workflow.","offers":[{"@type":"Offer","name":"Solo","price":"19","priceCurrency":"USD"},{"@type":"Offer","name":"Team","price":"49","priceCurrency":"USD"},{"@type":"Offer","name":"HQ","price":"99","priceCurrency":"USD"}],"publisher":{"@type":"Organization","name":"Agentically","url":"https://getagentically.com/","parentOrganization":{"@type":"Organization","name":"HPM3 LLC"}}}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#06080d; --panel:#0c1119; --panel2:#101828; --line:#1c2940;
+    --text:#dbe4ee; --dim:#8296ac; --accent:#37e0c8; --accent2:#5aa2ff;
+    --warn:#ffb454; --mono:'JetBrains Mono',ui-monospace,Consolas,monospace;
+    --sans:'Inter',system-ui,-apple-system,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.6;margin:0}
+  a{color:var(--accent2);text-decoration:none}
+  .wrap{max-width:1020px;margin:0 auto;padding:0 20px}
+  nav{display:flex;align-items:center;justify-content:space-between;padding:20px 0;border-bottom:1px solid var(--line)}
+  .logo{font-weight:800;font-size:19px;letter-spacing:-.02em;color:#fff}
+  .logo span{color:var(--accent)}
+  nav .links a{color:var(--dim);margin-left:22px;font-size:14px}
+  nav .links a:hover{color:#fff}
+  .cta{display:inline-block;background:var(--accent);color:#04211c !important;font-weight:700;padding:11px 22px;border-radius:10px;font-size:15px}
+  .cta:hover{filter:brightness(1.1)}
+  .cta.ghost{background:transparent;color:var(--accent) !important;border:1px solid var(--accent)}
+  .hero{padding:76px 0 60px;text-align:center}
+  .hero .pill{font-family:var(--mono);font-size:12px;color:var(--accent);border:1px solid var(--line);border-radius:99px;padding:5px 14px;display:inline-block;margin-bottom:22px;letter-spacing:.1em}
+  h1{font-size:clamp(34px,6.5vw,58px);line-height:1.1;margin:0 0 18px;letter-spacing:-.03em;color:#fff}
+  h1 em{font-style:normal;color:var(--accent)}
+  .hero p.lead{font-size:19px;color:var(--dim);max-width:640px;margin:0 auto 30px}
+  .hud{margin:56px auto 0;max-width:760px;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;text-align:left;box-shadow:0 30px 80px rgba(55,224,200,.06)}
+  .hud .bar{display:flex;gap:8px;margin-bottom:14px}
+  .hud .dot{width:10px;height:10px;border-radius:99px;background:#22314a}
+  .hud .dot:first-child{background:var(--accent)}
+  .oprow{display:flex;gap:12px;flex-wrap:wrap}
+  .opcard{flex:1 1 160px;background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .opcard .nm{font-weight:700;color:#fff;font-size:14px}
+  .opcard .rl{font-family:var(--mono);font-size:11px;color:var(--accent);margin:2px 0 8px}
+  .opcard .st{font-size:12px;color:var(--dim)}
+  .live{display:inline-block;width:7px;height:7px;border-radius:99px;background:var(--accent);margin-right:6px;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .cmd{margin-top:14px;background:#080d15;border:1px solid var(--line);border-radius:10px;padding:12px 14px;font-family:var(--mono);font-size:13px;color:var(--dim)}
+  .cmd b{color:var(--accent)}
+  section{padding:64px 0;border-top:1px solid var(--line)}
+  h2{font-size:30px;letter-spacing:-.02em;color:#fff;margin:0 0 8px;text-align:center}
+  .subhead{color:var(--dim);text-align:center;max-width:560px;margin:0 auto 40px}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+  @media(max-width:760px){.grid3{grid-template-columns:1fr}}
+  .step{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+  .step .num{font-family:var(--mono);color:var(--accent);font-size:13px;margin-bottom:10px}
+  .step h3{margin:0 0 8px;color:#fff;font-size:17px}
+  .step p{margin:0;color:var(--dim);font-size:14.5px}
+  .price{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:26px;display:flex;flex-direction:column}
+  .price.feat{border-color:var(--accent);box-shadow:0 0 40px rgba(55,224,200,.09)}
+  .price .tname{font-weight:700;color:#fff;font-size:17px}
+  .price .amt{font-size:38px;font-weight:800;color:#fff;margin:10px 0 2px;font-family:var(--mono)}
+  .price .amt small{font-size:14px;color:var(--dim);font-weight:400;font-family:var(--sans)}
+  .price ul{list-style:none;padding:0;margin:16px 0 22px;flex:1}
+  .price li{padding:5px 0;color:var(--dim);font-size:14px}
+  .price li::before{content:"▸ ";color:var(--accent)}
+  .badge{font-family:var(--mono);font-size:11px;color:var(--warn);letter-spacing:.1em}
+  .wide{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:26px;margin-top:18px;display:flex;flex-wrap:wrap;gap:20px;align-items:center;justify-content:space-between}
+  .faq{max-width:720px;margin:0 auto}
+  details{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 20px;margin:10px 0}
+  summary{cursor:pointer;font-weight:600;color:#fff;font-size:15px}
+  details p{color:var(--dim);font-size:14.5px;margin:10px 0 0}
+  footer{border-top:1px solid var(--line);padding:34px 0;color:var(--dim);font-size:13px;text-align:center}
+  .signup{display:flex;gap:10px;max-width:460px;margin:0 auto;flex-wrap:wrap;justify-content:center}
+  .signup input{flex:1 1 240px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 16px;color:#fff;font-size:15px;font-family:var(--sans)}
+  .signup input:focus{outline:none;border-color:var(--accent)}
+  .note{font-family:var(--mono);font-size:11px;color:var(--dim);text-align:center;margin-top:12px}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<nav>
+  <div class="logo">agentic<span>ally</span></div>
+  <div class="links">
+    <a href="#how">How it works</a><a href="#operators">Operators</a><a href="#pricing">Pricing</a>
+    <a class="cta" href="#early" style="margin-left:22px;padding:9px 18px">Get early access</a>
+  </div>
+</nav>
+
+<div class="hero">
+  <span class="pill">AGENTIC SYSTEMS · FOR BUSINESS &amp; LIFE</span>
+  <h1>Your business, staffed<br>by <em>AI operators.</em></h1>
+  <p class="lead">Agentically gives you a team of named AI agents with real roles — marketing, ops, client work, research — running in one command center you talk to. It acts. You approve.</p>
+  <a class="cta" href="#early">Get early access</a>&nbsp;&nbsp;<a class="cta ghost" href="#pricing">See pricing</a>
+
+  <div class="hud">
+    <div class="bar"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+    <div class="oprow">
+      <div class="opcard"><div class="nm">Chief</div><div class="rl">ROUTER</div><div class="st"><span class="live"></span>Routing 2 tasks</div></div>
+      <div class="opcard"><div class="nm">Maya</div><div class="rl">MARKETING</div><div class="st"><span class="live"></span>Drafting 3 posts</div></div>
+      <div class="opcard"><div class="nm">Cole</div><div class="rl">OPERATIONS</div><div class="st">Awaiting approval</div></div>
+    </div>
+    <div class="cmd"><b>❯</b> "Maya, get this week's content queued for my review" <span style="opacity:.5">▊</span></div>
+  </div>
+</div>
+
+<section id="how">
+  <h2>How it works</h2>
+  <p class="subhead">Three steps from empty seat to working operator.</p>
+  <div class="grid3">
+    <div class="step"><div class="num">01</div><h3>Hire your operators</h3><p>Pick from the operator gallery or create your own — name, role, lane, and standing orders. Each one knows exactly what it owns and what it doesn't touch.</p></div>
+    <div class="step"><div class="num">02</div><h3>Talk to your HQ</h3><p>Type or speak. Chief routes the work to the right operator. They research, draft, schedule, and build — on the web, on your desktop, or in the cloud while you sleep.</p></div>
+    <div class="step"><div class="num">03</div><h3>You approve, they ship</h3><p>Nothing posts, sends, or spends without your explicit yes. Every deliverable lands in your approvals inbox as an exact final replica. You stay the boss.</p></div>
+  </div>
+</section>
+
+<section id="operators">
+  <h2>Operators, not chatbots</h2>
+  <p class="subhead">A chatbot answers questions. An operator owns a lane, remembers your business, and comes back with finished work.</p>
+  <div class="grid3">
+    <div class="step"><div class="num">MARKETING</div><h3>Content &amp; growth</h3><p>Plans content, drafts posts and ads, studies competitors, queues everything for your approval.</p></div>
+    <div class="step"><div class="num">OPERATIONS</div><h3>Back office</h3><p>Vendor research, comparison tables, document drafts, subscription tracking, renewal alerts.</p></div>
+    <div class="step"><div class="num">CLIENT SERVICES</div><h3>Client work</h3><p>Runs a client account end to end — deliverables, reports, and content calendars, gated by your sign-off.</p></div>
+    <div class="step"><div class="num">RESEARCH</div><h3>Deep dives</h3><p>Market research memos with linked sources. Numbers are sourced or labeled estimates — never invented.</p></div>
+    <div class="step"><div class="num">ANALYST</div><h3>Numbers</h3><p>Tracks performance, builds spreadsheets, and reports what's working and what's bleeding.</p></div>
+    <div class="step"><div class="num">CUSTOM</div><h3>Your call</h3><p>Define any role your business needs. Give it a name, a lane, and standing orders. It shows up every day.</p></div>
+  </div>
+</section>
+
+<section id="pricing">
+  <h2>Pricing that scales with your team</h2>
+  <p class="subhead">Pay per operator seat, like you'd pay for people — at a fraction of the cost. Annual plans get 2 months free.</p>
+  <div class="grid3">
+    <div class="price">
+      <div class="tname">Solo</div>
+      <div class="amt">$19<small>/mo</small></div>
+      <ul><li>1 operator</li><li>Chat + voice (browser)</li><li>Approvals inbox</li><li>Web &amp; phone browser</li></ul>
+      <a class="cta ghost" href="#early" style="text-align:center">Start with Solo</a>
+    </div>
+    <div class="price feat">
+      <div class="badge">MOST POPULAR</div>
+      <div class="tname">Team</div>
+      <div class="amt">$49<small>/mo</small></div>
+      <ul><li>3 operators + Chief router</li><li>Scheduled runs (works while you sleep)</li><li>Shared business memory</li><li>Everything in Solo</li></ul>
+      <a class="cta" href="#early" style="text-align:center">Start with Team</a>
+    </div>
+    <div class="price">
+      <div class="tname">HQ</div>
+      <div class="amt">$99<small>/mo</small></div>
+      <ul><li>10 operators</li><li>Premium natural voice</li><li>Claude connector access</li><li>Priority support</li></ul>
+      <a class="cta ghost" href="#early" style="text-align:center">Start with HQ</a>
+    </div>
+  </div>
+  <div class="wide">
+    <div style="flex:1 1 300px"><strong style="color:#fff">Desktop License — $249 one-time.</strong><br><span class="dim" style="color:var(--dim);font-size:14px">Install Agentically on your computer, bring your own API key, run unlimited operators locally. Yours forever.</span></div>
+    <div style="flex:1 1 300px"><strong style="color:#fff">Done-for-you builds — from $1,500.</strong><br><span style="color:var(--dim);font-size:14px">We interview you, build your operator team, and manage it monthly. For businesses that want it handled.</span></div>
+    <a class="cta ghost" href="#early">Talk to us</a>
+  </div>
+  <p class="note">Extra operators: $10/mo each on any cloud plan.</p>
+</section>
+
+<section>
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details><summary>How is this different from ChatGPT or Claude?</summary><p>Those are brilliant generalists in a chat tab. Agentically is the layer on top: named operators with defined roles, persistent memory of your business, standing orders, scheduled runs, and an approvals workflow — a system, not a conversation.</p></details>
+    <details><summary>Can it really talk?</summary><p>Yes. Voice works in the browser on every plan; HQ plans get premium natural voices. Talk to your operators from your phone or computer like a call with your team.</p></details>
+    <details><summary>Will it do things without my permission?</summary><p>No. The approval gate is the core of the product: nothing publishes, sends, spends, or ships until you approve the exact final version. Autonomy where it's safe, sign-off where it matters.</p></details>
+    <details><summary>Phone or computer?</summary><p>The web app works on both today. Desktop install is available with the one-time license; native mobile apps are on the roadmap.</p></details>
+    <details><summary>What if I already use Claude?</summary><p>Even better — Agentically is built to plug into Claude as a connector, so your operators are available right inside the tools you already use.</p></details>
+  </div>
+</section>
+
+<section id="early" style="text-align:center">
+  <h2>Get early access</h2>
+  <p class="subhead">We're onboarding founding users now. Founding pricing locks for life.</p>
+  <div class="signup">
+    <input type="email" id="wlEmail" placeholder="you@company.com" aria-label="Email">
+    <a class="cta" href="#" onclick="joinWaitlist();return false">Join the waitlist</a>
+  </div>
+  <p class="note" id="wlNote">Founding pricing locks for life.</p>
+</section>
+
+<footer>agentically · getagentically.com · an HPM3 company · © 2026</footer>
+</div>
+
+<script>
+async function joinWaitlist(){
+  const el=document.getElementById('wlEmail'), note=document.getElementById('wlNote');
+  const email=(el.value||'').trim();
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)){note.textContent='Enter a valid email.';return}
+  note.textContent='Joining…';
+  try{
+    const r=await fetch('/api/waitlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})});
+    if(r.ok){note.textContent="You're in. We'll be in touch soon.";el.value=''}
+    else{note.textContent='Something went wrong — try again.'}
+  }catch(e){note.textContent='Something went wrong — try again.'}
+}
+</script>
+</body>
+</html>
