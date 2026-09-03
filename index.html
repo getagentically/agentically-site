@@ -33,6 +33,19 @@
   nav .links{display:flex;align-items:center}
   nav .links a{color:var(--dim);margin-left:22px;font-size:14px}
   nav .links a:hover{color:#fff}
+  @media(max-width:640px){
+    nav{flex-direction:column;gap:12px;padding:16px 0}
+    nav .links{flex-wrap:wrap;justify-content:center;row-gap:10px}
+    nav .links a{margin:0 9px !important;white-space:nowrap;font-size:13.5px}
+    .hero{padding:34px 0 44px}
+    .oprow{flex-wrap:nowrap;overflow-x:auto;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;scrollbar-width:none;margin:0 -4px;padding:0 4px}
+    .oprow::-webkit-scrollbar{display:none}
+    .opcard{flex:0 0 78%;scroll-snap-align:center}
+    .hud .bar{justify-content:center}
+    .hud .dot.on{background:var(--accent)}
+    .hud .dot:first-child{background:#22314a}
+    .hud .dot:first-child.on{background:var(--accent)}
+  }
   .cta{display:inline-block;background:var(--accent);color:#04211c !important;font-weight:700;padding:11px 22px;border-radius:10px;font-size:15px}
   .cta:hover{filter:brightness(1.1)}
   .cta.ghost{background:transparent;color:var(--accent) !important;border:1px solid var(--accent)}
@@ -110,6 +123,13 @@
     </div>
     <div class="cmd"><b>❯</b> "Maya, get this week's content queued for my review" <span style="opacity:.5">▊</span></div>
   </div>
+<script>
+(function(){var row=document.querySelector('.oprow'),dots=document.querySelectorAll('.hud .dot'),cards=document.querySelectorAll('.opcard');
+function upd(){if(window.innerWidth>640)return;var i=Math.round(row.scrollLeft/(row.scrollWidth-row.clientWidth)*(cards.length-1))||0;dots.forEach(function(d,x){d.classList.toggle('on',x===i)})}
+row.addEventListener('scroll',upd,{passive:true});window.addEventListener('resize',upd);upd();
+dots.forEach(function(d,x){d.style.cursor='pointer';d.addEventListener('click',function(){if(window.innerWidth>640)return;cards[x].scrollIntoView({behavior:'smooth',block:'nearest',inline:'center'})})});
+})();
+</script>
 </div>
 
 <section id="how">
