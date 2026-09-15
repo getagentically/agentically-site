@@ -574,6 +574,79 @@ app.post("/api/operators/adopt", auth, async (req, res) => {
 
 app.delete("/api/operators/:id", auth, (req, res) => res.json({ ok: STORE.deleteOperator(req.ws, req.params.id) }));
 
+
+/* Bulk import: paste many agents once (separated by --- lines), upsert by name. Full-fidelity: original text stored verbatim as orders. */
+app.post("/api/operators/import", auth, async (req, res) => {
+  const ws = req.ws;
+  const body = req.body || {};
+  const apiKey = keyFor(req);
+  if (!apiKey) return res.status(503).json({ error: "no_api_key" });
+
+  let chunks = Array.isArray(body.agents)
+    ? body.agents.map(s => String(s || "").trim())
+    : String(body.text || "").split(/^\s*(?:---+|===+|###\s*AGENT\b.*)\s*$/mi).map(s => s.trim());
+  chunks = chunks.filter(s => s.length >= 20).slice(0, 60);
+  if (!chunks.length) return res.status(400).json({ error: "nothing to import", hint: "Paste your agents separated by a line containing only ---" });
+
+  const limit = LOCAL ? Infinity : (PLANS[ws.plan] || PLANS.solo).seats;
+  const usingOwnKey = !!String(req.headers["x-anthropic-key"] || "").trim();
+  const SYSTEM = "You are labelling an existing AI agent so it can be displayed on a roster. You are NOT rewriting or summarising its instructions. Reply with ONLY a JSON object, no markdown fences, with keys: name (short human first name - keep the agent's existing name if one appears, otherwise choose a fitting human first name), role (2-4 word job title), lane (one line: what this operator owns), bio (one warm sentence about who this team member is). Do not include an orders key. Do not invent capabilities not present in the text.";
+
+  async function labelOne(text) {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: MODEL, max_tokens: 400, system: SYSTEM, messages: [{ role: "user", content: text.slice(0, 6000) }] })
+    });
+    if (!r.ok) throw new Error("label_failed");
+    const data = await r.json();
+    const raw = (data.content || []).filter(c => c.type === "text").map(c => c.text).join("");
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error("label_failed");
+    const p = JSON.parse(m[0]);
+    if (!p.name || !p.role || !p.lane) throw new Error("label_failed");
+    return p;
+  }
+
+  const results = [];
+  const seen = [];
+  const BATCH = 4;
+  for (let i = 0; i < chunks.length; i += BATCH) {
+    const slice = chunks.slice(i, i + BATCH);
+    const labelled = await Promise.all(slice.map(async text => {
+      try { return { ok: true, p: await labelOne(text), text }; }
+      catch (e) { return { ok: false, snippet: text.slice(0, 60) }; }
+    }));
+    for (const out of labelled) {
+      if (!out.ok) { results.push({ status: "failed", snippet: out.snippet }); continue; }
+      const p = out.p;
+      const fields = {
+        name: String(p.name).slice(0, 40),
+        role: String(p.role).slice(0, 60),
+        lane: String(p.lane).slice(0, 200),
+        bio: String(p.bio || "").slice(0, 200),
+        orders: out.text.slice(0, 40000)
+      };
+      seen.push(fields.name.toLowerCase());
+      const existing = ws.operators.find(o => (o.name || "").toLowerCase() === fields.name.toLowerCase());
+      if (existing) {
+        STORE.updateOperator(ws, existing.id, fields);
+        results.push({ status: "updated", name: fields.name, role: fields.role, chars: fields.orders.length });
+      } else {
+        if (ws.operators.length >= limit) { results.push({ status: "skipped", name: fields.name, reason: "seat limit reached", limit, plan: ws.plan }); continue; }
+        STORE.addOperator(ws, Object.assign({}, fields, { origin: "adopted" }));
+        results.push({ status: "created", name: fields.name, role: fields.role, chars: fields.orders.length });
+      }
+      if (!usingOwnKey) STORE.bumpUsage(ws);
+    }
+  }
+
+  const count = s => results.filter(r => r.status === s).length;
+  STORE.log(ws, "System", "bulk import - " + count("created") + " created, " + count("updated") + " updated, " + count("failed") + " failed");
+  res.json({ ok: true, created: count("created"), updated: count("updated"), skipped: count("skipped"), failed: count("failed"), results });
+});
+
+
 app.post("/api/plan", auth, (req, res) => {
   if (req.ws.plan !== "founder" && !LOCAL) return res.status(403).json({ error: "Plans are managed through billing." });
   res.json({ ok: true, plan: req.ws.plan });
