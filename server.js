@@ -935,7 +935,9 @@ app.listen(PORT, () => console.log("Agentically v2 on :" + PORT + " (model " + M
     const marker = path.join(DATA_DIR, "roster_hash.txt");
     let last = ""; try { last = fs.readFileSync(marker, "utf8").trim(); } catch (e) {}
     if (last === hash) { console.log("roster sync: up to date (" + hash.slice(0, 12) + ")"); return; }
-    const text = Buffer.from(parts.join(""), "base64").toString("utf8");
+    let buf = Buffer.from(parts.join(""), "base64");
+    if (buf[0] === 0x1f && buf[1] === 0x8b) buf = require("zlib").gunzipSync(buf); // gzip magic bytes: bundle may be gzip+base64
+    const text = buf.toString("utf8");
     await new Promise(r => setTimeout(r, 4000));
     const res = await fetch("http://127.0.0.1:" + PORT + "/api/operators/import", { method: "POST", headers: { "content-type": "application/json", "x-workspace-key": ADMIN_KEY }, body: JSON.stringify({ text }) });
     const j = await res.json().catch(() => ({}));
