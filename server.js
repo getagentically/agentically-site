@@ -585,10 +585,7 @@ app.post("/api/operators/import", auth, async (req, res) => {
   let chunks = Array.isArray(body.agents)
     ? body.agents.map(s => String(s || "").trim())
     : String(body.text || "").split(/^\s*(?:---+|===+|###\s*AGENT\b.*)\s*$/mi).map(s => s.trim());
-  { const merged = []; for (let i = 0; i < chunks.length; i++) { const c = chunks[i]; if (/^name:\s*\S/m.test(c) && c.length < 600 && i + 1 < chunks.length) { chunks[i + 1] = "---
-" + c + "
----
-" + chunks[i + 1]; continue; } merged.push(c); } chunks = merged; } chunks = chunks.filter(s => s.length >= 20).slice(0, 60);
+  { const NL = String.fromCharCode(10); const merged = []; for (let i = 0; i < chunks.length; i++) { const c = chunks[i]; if (/^name: *[^ ]/m.test(c) && c.length < 600 && i + 1 < chunks.length) { chunks[i + 1] = "---" + NL + c + NL + "---" + NL + chunks[i + 1]; continue; } merged.push(c); } chunks = merged; } chunks = chunks.filter(s => s.length >= 20).slice(0, 60);
   if (!chunks.length) return res.status(400).json({ error: "nothing to import", hint: "Paste your agents separated by a line containing only ---" });
 
   const limit = LOCAL ? Infinity : (PLANS[ws.plan] || PLANS.solo).seats;
