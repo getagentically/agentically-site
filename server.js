@@ -435,7 +435,7 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), (req, res
   } catch (e) { res.status(400).end(); }
 });
 
-app.use(express.json({ limit: "200kb" }));
+app.use(express.json({ limit: "2mb" }));
 
 /* ---------- marketing site ---------- */
 const page = f => (_q, res) => res.sendFile(path.join(__dirname, f));
@@ -545,7 +545,7 @@ app.post("/api/operators/adopt", auth, async (req, res) => {
   const ws = req.ws;
   const limit = LOCAL ? Infinity : (PLANS[ws.plan] || PLANS.solo).seats;
   if (ws.operators.length >= limit) return res.status(402).json({ error: "seat limit reached", limit, plan: ws.plan });
-  const pasted = String((req.body || {}).text || "").trim().slice(0, 12000);
+  const pasted = String((req.body || {}).text || "").trim().slice(0, 40000);
   if (pasted.length < 20) return res.status(400).json({ error: "paste the agent's instructions or description (at least a few sentences)" });
   const apiKey = keyFor(req);
   if (!apiKey) return res.status(503).json({ error: "no_api_key" });
@@ -566,7 +566,7 @@ app.post("/api/operators/adopt", auth, async (req, res) => {
     if (!m) return res.status(502).json({ error: "parse_failed" });
     const p = JSON.parse(m[0]);
     if (!p.name || !p.role || !p.lane) return res.status(502).json({ error: "parse_failed" });
-    const op = STORE.addOperator(ws, { name: String(p.name).slice(0, 40), role: String(p.role).slice(0, 60), lane: String(p.lane).slice(0, 200), orders: String(p.orders || "").slice(0, 1500), bio: String(p.bio || "").slice(0, 200), voiceId: String((req.body || {}).voiceId || ""), origin: "adopted" });
+    const op = STORE.addOperator(ws, { name: String(p.name).slice(0, 40), role: String(p.role).slice(0, 60), lane: String(p.lane).slice(0, 200), orders: pasted, bio: String(p.bio || "").slice(0, 200), voiceId: String((req.body || {}).voiceId || ""), origin: "adopted" });
     if (!String(req.headers["x-anthropic-key"] || "").trim()) STORE.bumpUsage(ws);
     res.json({ operator: op });
   } catch (e) { res.status(502).json({ error: "parse_failed" }); }
