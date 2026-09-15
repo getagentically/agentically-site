@@ -920,3 +920,26 @@ app.post("/mcp/:wskey", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log("Agentically v2 on :" + PORT + " (model " + MODEL + ", stripe " + (STRIPE_KEY ? "on" : "off") + ")"));
+
+
+
+/* Roster sync (added 2026-09-15): a scheduled Claude task writes the operator bundle into Railway env vars
+   ROSTER_HASH + ROSTER_BUNDLE_1..N (base64 of agents separated by ===== lines). Railway redeploys on a variable
+   change; on boot, if ROSTER_HASH differs from the last one applied (stored on the volume), the bundle is fed
+   through the founder workspace's own /api/operators/import so the app copy always matches the skill files. */
+(async () => {
+  try {
+    const hash = String(process.env.ROSTER_HASH || "").trim();
+    const parts = Object.keys(process.env).filter(k => /^ROSTER_BUNDLE_\d+$/.test(k)).sort((a, b) => parseInt(a.split("_")[2], 10) - parseInt(b.split("_")[2], 10)).map(k => process.env[k]);
+    if (!hash || !parts.length || !ADMIN_KEY) return;
+    const marker = path.join(DATA_DIR, "roster_hash.txt");
+    let last = ""; try { last = fs.readFileSync(marker, "utf8").trim(); } catch (e) {}
+    if (last === hash) { console.log("roster sync: up to date (" + hash.slice(0, 12) + ")"); return; }
+    const text = Buffer.from(parts.join(""), "base64").toString("utf8");
+    await new Promise(r => setTimeout(r, 4000));
+    const res = await fetch("http://127.0.0.1:" + PORT + "/api/operators/import", { method: "POST", headers: { "content-type": "application/json", "x-workspace-key": ADMIN_KEY }, body: JSON.stringify({ text }) });
+    const j = await res.json().catch(() => ({}));
+    if (res.ok) { fs.writeFileSync(marker, hash); console.log("roster sync applied " + hash.slice(0, 12) + " created=" + j.created + " updated=" + j.updated + " failed=" + j.failed); }
+    else console.log("roster sync failed HTTP " + res.status + " " + JSON.stringify(j));
+  } catch (e) { console.log("roster sync error: " + e.message); }
+})();
