@@ -78,7 +78,7 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
     shopify: {
       label: "Shopify", type: "builtin", provider: "token",
       ready: () => true,
-      tokenHelp: "Shopify admin → Settings → Apps and sales channels → Develop apps → Create app → Admin API scopes (read/write products, orders, customers, inventory, discounts) → Install → copy the Admin API access token. Paste as  yourstore.myshopify.com|shpat_xxx",
+      tokenHelp: "Dev Dashboard app: paste yourstore.myshopify.com|client_id|client_secret (from the app's Settings page, after installing it on the store). Legacy custom app: Shopify admin → Settings → Apps and sales channels → Develop apps → Create app → Admin API scopes (read/write products, orders, customers, inventory, discounts) → Install → copy the Admin API access token. Paste as  yourstore.myshopify.com|shpat_xxx",
       setup: "Paste  store-domain|admin-api-token  (custom app token)"
     },
     "meta-ads": {
@@ -252,8 +252,16 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
     if (!s || (s.type !== "mcp" && s.provider !== "token")) throw new Error("token paste is not available for this service");
     let tok = String(token || "").trim(), account = "token", extra = {};
     if (service === "shopify") {
-      const m = tok.match(/^([a-z0-9][a-z0-9-]*\.myshopify\.com)\s*[|,\s]\s*(shpat_[A-Za-z0-9]+|shpca_[A-Za-z0-9]+|[A-Za-z0-9_-]{20,})$/i);
-      if (!m) throw new Error("Format: yourstore.myshopify.com|shpat_token");
+      const cc = tok.match(/^([a-z0-9][a-z0-9-]*\.myshopify\.com)\s*[|,\s]\s*([a-f0-9]{32})\s*[|,\s]\s*(shpss_[A-Za-z0-9]+|[A-Za-z0-9_-]{20,})$/i);
+      const m = cc ? null : tok.match(/^([a-z0-9][a-z0-9-]*\.myshopify\.com)\s*[|,\s]\s*(shpat_[A-Za-z0-9]+|shpca_[A-Za-z0-9]+|[A-Za-z0-9_-]{20,})$/i);
+      if (!cc && !m) throw new Error("Format: yourstore.myshopify.com|shpat_token  or  yourstore.myshopify.com|client_id|client_secret");
+      if (cc) {
+        // Dev Dashboard app: client-credentials grant (token expires ~24h; refreshed automatically)
+        extra = { shop: cc[1].toLowerCase(), cc: true }; account = extra.shop;
+        const t = await shopifyClientCredentials(extra.shop, cc[2], cc[3]);
+        const rec = putConn(ws, service, { tokens: { access_token: t.access_token, refresh_token: "", expires_at: t.expires_at, cc_id: cc[2], cc_secret: cc[3] }, account, connectedBy: ws.email || "owner", extra });
+        return rec;
+      }
       extra = { shop: m[1].toLowerCase() }; tok = m[2]; account = extra.shop;
       const r = await fetch("https://" + extra.shop + "/admin/api/2025-07/shop.json", { headers: { "X-Shopify-Access-Token": tok } });
       if (!r.ok) throw new Error("Shopify rejected the token (HTTP " + r.status + ")");
@@ -272,8 +280,20 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
     return rec;
   }
 
+  async function shopifyClientCredentials(shop, clientId, clientSecret) {
+    const r = await fetch("https://" + shop + "/admin/oauth/access_token", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, grant_type: "client_credentials" }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.access_token) throw new Error("Shopify rejected the app credentials (HTTP " + r.status + "): " + (j.error_description || j.error || j.errors || "is the app installed on this store?"));
+    return { access_token: j.access_token, expires_at: Date.now() + ((j.expires_in || 86400) - 300) * 1000 };
+  }
+
   async function accessToken(ws, conn) {
     let t = dec(conn.tokens);
+    if (t.cc_id && t.cc_secret && (!t.expires_at || Date.now() > t.expires_at - 60000)) {
+      const nt = await shopifyClientCredentials((conn.extra || {}).shop, t.cc_id, t.cc_secret);
+      t = Object.assign(t, nt); conn.tokens = enc(t); STORE.save();
+      return t.access_token;
+    }
     if (t.expires_at && Date.now() > t.expires_at - 60000 && t.refresh_token) {
       const s = SERVICES[conn.service];
       let nt;
