@@ -362,6 +362,26 @@ const STORE = {
     save();
     return item;
   },
+  createMcpToken(ws, label) {
+    const raw = "agk_" + require("crypto").randomBytes(24).toString("base64url");
+    const hash = require("crypto").createHash("sha256").update(raw).digest("hex");
+    ws.mcpTokens = ws.mcpTokens || [];
+    const t = { id: id("tk"), label: String(label || "Claude").slice(0, 60), hash, createdAt: now(), lastUsed: null };
+    ws.mcpTokens.push(t); this.log(ws, "You", "created connector token \"" + t.label + "\""); save();
+    return { token: raw, rec: t };
+  },
+  revokeMcpToken(ws, tkId) {
+    const before = (ws.mcpTokens || []).length;
+    ws.mcpTokens = (ws.mcpTokens || []).filter(t => t.id !== tkId);
+    if (ws.mcpTokens.length < before) { this.log(ws, "You", "revoked a connector token"); save(); return true; }
+    return false;
+  },
+  byMcpToken(raw) {
+    if (!raw || !String(raw).startsWith("agk_")) return null;
+    const hash = require("crypto").createHash("sha256").update(String(raw)).digest("hex");
+    for (const [wid, ws] of Object.entries(state.workspaces)) { const t = (ws.mcpTokens || []).find(x => x.hash === hash); if (t) { t.lastUsed = now(); save(); return Object.assign(ws, { _id: wid }); } }
+    return null;
+  },
   addClaudeRequest(ws, r) {
     ws.claudeRequests = ws.claudeRequests || [];
     const rq = { id: id("cq"), operatorId: r.operatorId, operatorName: r.operatorName, task: String(r.task || "").slice(0, 4000), context: String(r.context || "").slice(0, 4000), status: "pending", createdAt: now() };
@@ -780,6 +800,9 @@ app.post("/api/approvals/:id/:action", auth, async (req, res) => {
   }
   res.json({ item });
 });
+app.get("/api/mcp-tokens", auth, (req, res) => res.json({ tokens: (req.ws.mcpTokens || []).map(t => ({ id: t.id, label: t.label, createdAt: t.createdAt, lastUsed: t.lastUsed })) }));
+app.post("/api/mcp-tokens", auth, (req, res) => { const r = STORE.createMcpToken(req.ws, (req.body || {}).label); res.json({ id: r.rec.id, label: r.rec.label, url: BASE_URL + "/mcp/" + r.token }); });
+app.delete("/api/mcp-tokens/:id", auth, (req, res) => res.json({ ok: STORE.revokeMcpToken(req.ws, req.params.id) }));
 app.post("/api/facts", auth, (req, res) => {
   const text = String((req.body || {}).text || "").trim();
   if (!text) return res.status(400).json({ error: "empty" });
@@ -950,7 +973,7 @@ const MCP_TOOLS = [
 ];
 app.get("/mcp/:wskey", (_q, res) => res.status(405).json({ error: "POST JSON-RPC to this endpoint" }));
 app.post("/mcp/:wskey", async (req, res) => {
-  const ws = resolveWs(req.params.wskey);
+  const ws = STORE.byMcpToken(req.params.wskey) || resolveWs(req.params.wskey);
   if (!ws || ws.plan === "canceled") return res.status(401).json({ error: "unauthorized" });
   const m = req.body || {};
   const reply = result => res.json({ jsonrpc: "2.0", id: m.id, result });
@@ -987,7 +1010,7 @@ app.post("/mcp/:wskey", async (req, res) => {
         const q = String(args.operator || "").toLowerCase();
         const op = ws.operators.find(o => o.id === args.operator || o.name.toLowerCase() === q);
         if (!op) return fail("Unknown operator. Use list_operators first.");
-        const out = await operatorTurn({ ws, op, text: String(args.message || ""), apiKey: CLOUD_KEY, source: "connector" });
+        const out = await operatorTurn({ ws, op, text: "[Message from Claude, the owner's outside assistant, via the Claude connector — treat as coming from the owner's side]: " + String(args.message || ""), apiKey: CLOUD_KEY, source: "connector" });
         STORE.bumpUsage(ws);
         let msg = op.name + ": " + out.text;
         if (out.approvals.length) msg += "\n\n[" + out.approvals.length + " deliverable(s) queued in the approvals inbox — the owner must approve before anything ships.]";
