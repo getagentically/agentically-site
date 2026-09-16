@@ -301,14 +301,41 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
     return parts.join("\n").replace(/\s+\n/g, "\n").slice(0, 12000);
   }
   const hdr = (msg, n) => ((msg.payload && msg.payload.headers) || []).filter(h => h.name.toLowerCase() === n.toLowerCase()).map(h => h.value)[0] || "";
+  function gmailAttachments(payload) {
+    const out = [];
+    (function walk(p) { if (!p) return; if (p.filename && p.body && p.body.attachmentId) out.push({ attachmentId: p.body.attachmentId, filename: p.filename, mimeType: p.mimeType, size: p.body.size }); (p.parts || []).forEach(walk); })(payload);
+    return out;
+  }
+  const driveConnOf = ws => wsConns(ws).find(c => c.service === "google-drive");
+  const GOOGLE_EXPORT = { "application/vnd.google-apps.document": ["application/pdf", ".pdf"], "application/vnd.google-apps.spreadsheet": ["application/pdf", ".pdf"], "application/vnd.google-apps.presentation": ["application/pdf", ".pdf"] };
+  async function driveFetchBytes(ws, dconn, fileId) {
+    const D = "https://www.googleapis.com/drive/v3";
+    const meta = await gapi(ws, dconn, D + "/files/" + encodeURIComponent(fileId) + "?fields=id,name,mimeType,size");
+    const exp = GOOGLE_EXPORT[meta.mimeType];
+    const token = await accessToken(ws, dconn);
+    const url = exp ? D + "/files/" + meta.id + "/export?mimeType=" + encodeURIComponent(exp[0]) : D + "/files/" + meta.id + "?alt=media";
+    const res = await fetch(url, { headers: { authorization: "Bearer " + token } });
+    if (!res.ok) throw new Error("Drive download failed " + res.status);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > 20 * 1024 * 1024) throw new Error("attachment over 20MB");
+    return { name: meta.name + (exp && !meta.name.endsWith(exp[1]) ? exp[1] : ""), mimeType: exp ? exp[0] : (meta.mimeType || "application/octet-stream"), buf };
+  }
+  async function driveUpload(ws, dconn, { name, mimeType, buf, folderId }) {
+    const meta = { name, mimeType }; if (folderId) meta.parents = [folderId];
+    const boundary = "agentically" + crypto.randomBytes(6).toString("hex");
+    const head = Buffer.from("--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + JSON.stringify(meta) + "\r\n--" + boundary + "\r\nContent-Type: " + mimeType + "\r\nContent-Transfer-Encoding: base64\r\n\r\n", "utf8");
+    const body = Buffer.concat([head, Buffer.from(buf.toString("base64"), "utf8"), Buffer.from("\r\n--" + boundary + "--", "utf8")]);
+    return gapi(ws, dconn, "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink", { method: "POST", headers: { "content-type": "multipart/related; boundary=" + boundary }, body });
+  }
   const BUILTIN = {
     gmail: {
       tools: [
         { name: "search_messages", readOnly: true, description: "Search the mailbox with Gmail query syntax (e.g. 'from:x newer_than:7d'). Returns id, from, subject, date, snippet.", input_schema: { type: "object", properties: { query: { type: "string" }, max: { type: "integer", description: "1-25, default 10" } }, required: ["query"] } },
-        { name: "read_message", readOnly: true, description: "Read one message in full by id.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+        { name: "read_message", readOnly: true, description: "Read one message in full by id. Returns body and a list of attachments (attachmentId, filename, mimeType, size).", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+        { name: "save_attachment_to_drive", readOnly: false, description: "Download an attachment from an email and save it as a file in the connected Google Drive (returns the Drive file id + link). Requires Google Drive to be connected.", input_schema: { type: "object", properties: { messageId: { type: "string" }, attachmentId: { type: "string" }, filename: { type: "string" }, folderId: { type: "string", description: "optional Drive folder id" } }, required: ["messageId", "attachmentId", "filename"] } },
         { name: "list_threads", readOnly: true, description: "List recent threads matching a query.", input_schema: { type: "object", properties: { query: { type: "string" }, max: { type: "integer" } } } },
-        { name: "create_draft", readOnly: false, description: "Create a draft email (not sent).", input_schema: { type: "object", properties: { to: { type: "string" }, subject: { type: "string" }, body: { type: "string" }, cc: { type: "string" } }, required: ["to", "subject", "body"] } },
-        { name: "send_message", readOnly: false, description: "Send an email from the connected account.", input_schema: { type: "object", properties: { to: { type: "string" }, subject: { type: "string" }, body: { type: "string" }, cc: { type: "string" }, replyToMessageId: { type: "string", description: "optional: reply within this message's thread" } }, required: ["to", "subject", "body"] } }
+        { name: "create_draft", readOnly: false, description: "Create a draft email (not sent). Can attach files from the connected Google Drive.", input_schema: { type: "object", properties: { to: { type: "string" }, subject: { type: "string" }, body: { type: "string" }, cc: { type: "string" }, attachDriveFileIds: { type: "array", items: { type: "string" }, description: "Drive file ids to attach (Google Docs/Sheets/Slides are attached as PDF)" } }, required: ["to", "subject", "body"] } },
+        { name: "send_message", readOnly: false, description: "Send an email from the connected account. Can attach files from the connected Google Drive.", input_schema: { type: "object", properties: { to: { type: "string" }, subject: { type: "string" }, body: { type: "string" }, cc: { type: "string" }, replyToMessageId: { type: "string", description: "optional: reply within this message's thread" }, attachDriveFileIds: { type: "array", items: { type: "string" }, description: "Drive file ids to attach (Google Docs/Sheets/Slides are attached as PDF)" } }, required: ["to", "subject", "body"] } }
       ],
       async call(ws, conn, name, a) {
         const G = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -326,7 +353,17 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
         }
         if (name === "read_message") {
           const m = await gapi(ws, conn, G + "/messages/" + encodeURIComponent(a.id) + "?format=full");
-          return JSON.stringify({ id: m.id, threadId: m.threadId, from: hdr(m, "From"), to: hdr(m, "To"), cc: hdr(m, "Cc"), subject: hdr(m, "Subject"), date: hdr(m, "Date"), body: gmailBody(m.payload) });
+          return JSON.stringify({ id: m.id, threadId: m.threadId, from: hdr(m, "From"), to: hdr(m, "To"), cc: hdr(m, "Cc"), subject: hdr(m, "Subject"), date: hdr(m, "Date"), body: gmailBody(m.payload), attachments: gmailAttachments(m.payload) });
+        }
+        if (name === "save_attachment_to_drive") {
+          const dconn = driveConnOf(ws); if (!dconn) throw new Error("Google Drive is not connected — connect it on the Connections page first.");
+          const att = await gapi(ws, conn, G + "/messages/" + encodeURIComponent(a.messageId) + "/attachments/" + encodeURIComponent(a.attachmentId));
+          const buf = Buffer.from(String(att.data || ""), "base64url");
+          if (!buf.length) throw new Error("empty attachment");
+          const ext = String(a.filename).split(".").pop().toLowerCase();
+          const mime = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", pdf: "application/pdf", svg: "image/svg+xml", ai: "application/postscript", psd: "image/vnd.adobe.photoshop", zip: "application/zip", txt: "text/plain", csv: "text/csv", md: "text/markdown", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }[ext] || "application/octet-stream";
+          const r = await driveUpload(ws, dconn, { name: a.filename, mimeType: mime, buf, folderId: a.folderId });
+          return "Saved " + r.name + " to Drive — id " + r.id + " — " + (r.webViewLink || "");
         }
         if (name === "create_draft" || name === "send_message") {
           let headers = "To: " + a.to + "\r\n" + (a.cc ? "Cc: " + a.cc + "\r\n" : "") + "Subject: " + String(a.subject || "").replace(/[\r\n]/g, " ") + "\r\nContent-Type: text/plain; charset=utf-8\r\n";
@@ -335,7 +372,20 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
             const orig = await gapi(ws, conn, G + "/messages/" + encodeURIComponent(a.replyToMessageId) + "?format=metadata&metadataHeaders=Message-ID").catch(() => null);
             if (orig) { threadId = orig.threadId; const mid = hdr(orig, "Message-ID"); if (mid) headers += "In-Reply-To: " + mid + "\r\nReferences: " + mid + "\r\n"; }
           }
-          const raw = b64url(headers + "\r\n" + String(a.body || ""));
+          let raw;
+          const ids = Array.isArray(a.attachDriveFileIds) ? a.attachDriveFileIds.filter(Boolean).slice(0, 10) : [];
+          if (ids.length) {
+            const dconn = driveConnOf(ws); if (!dconn) throw new Error("Google Drive is not connected — cannot attach Drive files.");
+            const boundary = "agentically" + crypto.randomBytes(6).toString("hex");
+            headers = headers.replace(/Content-Type: text\/plain; charset=utf-8\r\n/, "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"" + boundary + "\"\r\n");
+            const parts = [Buffer.from("--" + boundary + "\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + String(a.body || "") + "\r\n", "utf8")];
+            for (const id of ids) {
+              const f = await driveFetchBytes(ws, dconn, id);
+              parts.push(Buffer.from("--" + boundary + "\r\nContent-Type: " + f.mimeType + "; name=\"" + f.name.replace(/"/g, "") + "\"\r\nContent-Disposition: attachment; filename=\"" + f.name.replace(/"/g, "") + "\"\r\nContent-Transfer-Encoding: base64\r\n\r\n" + f.buf.toString("base64").replace(/(.{76})/g, "$1\r\n") + "\r\n", "utf8"));
+            }
+            parts.push(Buffer.from("--" + boundary + "--", "utf8"));
+            raw = Buffer.concat([Buffer.from(headers + "\r\n", "utf8"), ...parts]).toString("base64url");
+          } else raw = b64url(headers + "\r\n" + String(a.body || ""));
           if (name === "create_draft") { const d = await gapi(ws, conn, G + "/drafts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: { raw, threadId } }) }); return "Draft created (id " + d.id + ")."; }
           const m = await gapi(ws, conn, G + "/messages/send", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ raw, threadId }) });
           return "Sent (message id " + m.id + ").";
@@ -390,7 +440,7 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
   const OVERRIDES = { // hand-maintained: misnamed tools
     "github:create_pull_request_review": "write", "github:request_copilot_review": "write", "github:fork_repository": "write",
     "railway:get-deployment-diagnosis": "read", "railway:accept-deploy": "write", "railway:redeploy": "write", "railway:restart-service": "write", "railway:set-variables": "write",
-    "gmail:create_draft": "write", "google-drive:create_doc": "write"
+    "gmail:create_draft": "write", "gmail:save_attachment_to_drive": "write", "google-drive:create_doc": "write"
   };
   function isWrite(service, tool) {
     const o = OVERRIDES[service + ":" + tool.name];
