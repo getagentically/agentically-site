@@ -152,9 +152,10 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
       const verifier = crypto.randomBytes(32).toString("base64url");
       const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
       const state = mkState(ws.key, service, { verifier, tokenEndpoint: meta.token_endpoint, clientId, resource: s.url });
-      const q = new URLSearchParams({ client_id: clientId, redirect_uri: redirectFor(service), response_type: "code", code_challenge: challenge, code_challenge_method: "S256", state, resource: s.url });
-      if (meta.scopes_supported && meta.scopes_supported.length) q.set("scope", meta.scopes_supported.join(" "));
-      return meta.authorization_endpoint + "?" + q;
+      const au = new URL(meta.authorization_endpoint); // endpoint may already carry a query string — never append with "?"
+      for (const [k, v] of Object.entries({ client_id: clientId, redirect_uri: redirectFor(service), response_type: "code", code_challenge: challenge, code_challenge_method: "S256", state, resource: s.url })) au.searchParams.set(k, v);
+      if (meta.scopes_supported && meta.scopes_supported.length) au.searchParams.set("scope", meta.scopes_supported.join(" "));
+      return au.toString();
     }
     throw new Error("unsupported provider");
   }
