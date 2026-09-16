@@ -46,6 +46,19 @@ const TOOLS = [
     }
   },
   {
+    name: "request_claude",
+    description:
+      "Hand a task to Claude — the owner's outside AI assistant (Cowork), which has its own tools: web research, file and document creation, code, the owner's calendar and scheduled tasks. Use when a task needs something no operator or connected tool here can do. Claude checks the request queue on a schedule and posts its result back into your thread; it does not answer instantly. Say clearly in your reply that the request is queued for Claude.",
+    input_schema: {
+      type: "object",
+      properties: {
+        task: { type: "string", description: "What you need Claude to do, stated completely — Claude has no access to this conversation" },
+        context: { type: "string", description: "Anything Claude needs to know: links, ids, constraints, deadline" }
+      },
+      required: ["task"]
+    }
+  },
+  {
     name: "talk_to_teammate",
     description:
       "Send a message to another operator on this workspace's roster and get their reply — like calling a colleague. Use when a task touches a teammate's lane (ask them for input, hand something off, coordinate). The exchange is visible to the owner in both your threads. You cannot approve anything on the owner's behalf this way.",
@@ -89,7 +102,7 @@ HOW YOU WORK — these rules are absolute:
 3. NEVER FABRICATE. No invented statistics, prices, reviews, follower counts, or sources. A number is either sourced or clearly labeled an estimate with the assumption stated. If you don't know something about the business, ask.
 4. Stay in your lane. If a request belongs to a different operator's role, say so and suggest which operator should handle it.
 5. Be concise and direct. The owner reads on a phone. Lead with the answer.
-6. Use remember_fact when you learn something durable about the business.
+6. Use remember_fact when you learn something durable about the business. Use request_claude to hand off work that needs the owner's outside assistant Claude (web research, documents, code, calendar, scheduling) — it answers later, not instantly.
 7. You can grow: if the owner keeps correcting you the same way, use propose_self_update to suggest better standing orders for yourself. The owner decides. Never claim your orders changed unless they approved it.${toolLines}`;
 }
 
@@ -114,7 +127,7 @@ async function callClaude({ apiKey, messages, system, maxTokens = 2000, tools })
 }
 
 // Runs one turn, resolving tool calls (max 4 hops), returns {text, approvals[], facts[]}
-async function runOperator({ apiKey, operator, facts, userText, onApproval, onFact, onSelfUpdate, onTeammate, teammates, extTools, onExtTool }) {
+async function runOperator({ apiKey, operator, facts, userText, onApproval, onFact, onSelfUpdate, onTeammate, teammates, extTools, onExtTool, onClaudeRequest }) {
   operator._teammates = teammates || [];
   operator._extToolCount = extTools ? extTools.defs.length : 0;
   operator._extServices = extTools ? [...new Set(Object.values(extTools.map).map(m => m.service))] : [];
@@ -171,6 +184,11 @@ async function runOperator({ apiKey, operator, facts, userText, onApproval, onFa
         } else {
           results.push({ type: "tool_result", tool_use_id: t.id, content: "Self-updates are not enabled here.", is_error: true });
         }
+      } else if (t.name === "request_claude") {
+        if (onClaudeRequest) {
+          const rq = onClaudeRequest(t.input);
+          results.push({ type: "tool_result", tool_use_id: t.id, content: "Queued for Claude as request " + rq.id + ". Claude checks the queue on a schedule and will post its result into this thread. Tell the owner it is queued — do not claim it is done." });
+        } else results.push({ type: "tool_result", tool_use_id: t.id, content: "Claude requests are not available in this context.", is_error: true });
       } else if (extTools && extTools.map[t.name] && onExtTool) {
         const r = await onExtTool(t.name, t.input || {});
         results.push(Object.assign({ type: "tool_result", tool_use_id: t.id, content: String(r.content || "") }, r.is_error ? { is_error: true } : {}));
@@ -343,6 +361,30 @@ const STORE = {
     }
     save();
     return item;
+  },
+  addClaudeRequest(ws, r) {
+    ws.claudeRequests = ws.claudeRequests || [];
+    const rq = { id: id("cq"), operatorId: r.operatorId, operatorName: r.operatorName, task: String(r.task || "").slice(0, 4000), context: String(r.context || "").slice(0, 4000), status: "pending", createdAt: now() };
+    ws.claudeRequests.unshift(rq);
+    ws.claudeRequests = ws.claudeRequests.slice(0, 200);
+    this.log(ws, r.operatorName, "asked Claude: " + rq.task.slice(0, 80));
+    save();
+    return rq;
+  },
+  resolveClaudeRequest(ws, rqId, result, status) {
+    const rq = (ws.claudeRequests || []).find(r => r.id === rqId);
+    if (!rq || rq.status !== "pending") return null;
+    rq.status = status === "declined" ? "declined" : "done";
+    rq.result = String(result || "").slice(0, 8000); rq.resolvedAt = now();
+    const op = ws.operators.find(o => o.id === rq.operatorId);
+    if (op) {
+      op.messages = op.messages || [];
+      op.messages.push({ role: "user", content: "[Claude " + (rq.status === "done" ? "completed" : "declined") + " your request " + rq.id + " (\"" + rq.task.slice(0, 120) + "\")]: " + rq.result, ts: now(), source: "claude" });
+      op.messages = op.messages.slice(-120);
+    }
+    this.log(ws, "Claude", (rq.status === "done" ? "completed" : "declined") + " " + (op ? op.name + "'s" : "a") + " request: " + rq.task.slice(0, 80));
+    save();
+    return rq;
   },
   addFact(ws, text) {
     if (!text || ws.facts.some(f => f.text === text)) return null;
@@ -530,7 +572,8 @@ app.get("/api/state", auth, (req, res) => {
     }),
     floor: ws.plan === "founder" || ws.plan === "floor" || LOCAL,
     approvals: ws.approvals.slice(0, 50), facts: ws.facts, schedules: ws.schedules, activity: ws.activity.slice(0, 30),
-    connections: (ws.connections || []).map(c => ({ service: c.service, account: c.account || "" })), connectionsEnabled: CONN.ENABLED
+    connections: (ws.connections || []).map(c => ({ service: c.service, account: c.account || "" })), connectionsEnabled: CONN.ENABLED,
+    claudeRequests: (ws.claudeRequests || []).filter(r => r.status === "pending").slice(0, 20)
   });
 });
 
@@ -687,6 +730,7 @@ async function operatorTurn({ ws, op, text, apiKey, source, depth }) {
     }),
     onApproval: input => STORE.addApproval(ws, { operatorId: op.id, operatorName: op.name, title: input.title, summary: input.summary, content: input.content }),
     onFact: f => STORE.addFact(ws, f),
+    onClaudeRequest: input => STORE.addClaudeRequest(ws, { operatorId: op.id, operatorName: op.name, task: input.task, context: input.context }),
     onSelfUpdate: input => STORE.addApproval(ws, {
       kind: "self_update", operatorId: op.id, operatorName: op.name,
       title: op.name + " wants to update their own standing orders",
@@ -895,7 +939,14 @@ const MCP_TOOLS = [
   { name: "list_approvals", description: "List pending items in the approvals inbox awaiting the owner's decision.", inputSchema: { type: "object", properties: {} } },
   { name: "resolve_approval", description: "Approve or reject a pending approvals-inbox item on the owner's behalf. Only use when the owner has explicitly decided.", inputSchema: { type: "object", properties: { id: { type: "string" }, decision: { type: "string", enum: ["approve", "reject"] } }, required: ["id", "decision"] } },
   { name: "add_fact", description: "Save a durable fact about the owner's business to shared operator memory.", inputSchema: { type: "object", properties: { fact: { type: "string" } }, required: ["fact"] } },
-  { name: "get_activity", description: "Recent workspace activity log.", inputSchema: { type: "object", properties: {} } }
+  { name: "get_activity", description: "Recent workspace activity log.", inputSchema: { type: "object", properties: {} } },
+  { name: "list_claude_requests", description: "List tasks the workspace's operators have queued for Claude (pending unless status is given). Each has id, operator, task, context, createdAt.", inputSchema: { type: "object", properties: { status: { type: "string", enum: ["pending", "done", "declined", "all"] } } } },
+  { name: "post_claude_result", description: "Post Claude's result for a queued request. Marks it done (or declined) and delivers the result into the requesting operator's thread so it can continue.", inputSchema: { type: "object", properties: { id: { type: "string" }, result: { type: "string" }, status: { type: "string", enum: ["done", "declined"] } }, required: ["id", "result"] } },
+  { name: "get_operator_thread", description: "Read an operator's recent conversation (last N messages) for context.", inputSchema: { type: "object", properties: { operator: { type: "string" }, limit: { type: "integer" } }, required: ["operator"] } },
+  { name: "list_schedules", description: "List scheduled operator runs (id, operator, hour, minute UTC, prompt).", inputSchema: { type: "object", properties: {} } },
+  { name: "add_schedule", description: "Schedule an operator to run a prompt daily at hour:minute (UTC). Use when the owner asks Claude to put something on an operator's schedule.", inputSchema: { type: "object", properties: { operator: { type: "string" }, hour: { type: "integer" }, minute: { type: "integer" }, prompt: { type: "string" } }, required: ["operator", "hour", "prompt"] } },
+  { name: "delete_schedule", description: "Remove a scheduled operator run by id.", inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+  { name: "list_connections", description: "List connected services and which operators may use them.", inputSchema: { type: "object", properties: {} } }
 ];
 app.get("/mcp/:wskey", (_q, res) => res.status(405).json({ error: "POST JSON-RPC to this endpoint" }));
 app.post("/mcp/:wskey", async (req, res) => {
@@ -917,6 +968,13 @@ app.post("/mcp/:wskey", async (req, res) => {
       if (p.name === "list_operators") return text(JSON.stringify(ws.operators.map(o => ({ id: o.id, name: o.name, role: o.role, lane: o.lane }))));
       if (p.name === "list_approvals") return text(JSON.stringify(ws.approvals.filter(a => a.status === "pending").map(a => ({ id: a.id, title: a.title, from: a.operatorName, summary: a.summary, content: a.content }))));
       if (p.name === "get_activity") return text(JSON.stringify(ws.activity.slice(0, 20)));
+      if (p.name === "list_claude_requests") { const st = args.status || "pending"; return text(JSON.stringify((ws.claudeRequests || []).filter(r => st === "all" || r.status === st).slice(0, 50).map(r => ({ id: r.id, operator: r.operatorName, task: r.task, context: r.context, status: r.status, createdAt: r.createdAt, result: r.result })))); }
+      if (p.name === "post_claude_result") { const rq = STORE.resolveClaudeRequest(ws, String(args.id || ""), String(args.result || ""), args.status); return rq ? text("Delivered to " + rq.operatorName + "'s thread (request " + rq.id + " " + rq.status + ").") : fail("No pending request with that id."); }
+      if (p.name === "get_operator_thread") { const q = String(args.operator || "").toLowerCase(); const op = ws.operators.find(o => o.id === args.operator || o.name.toLowerCase() === q); if (!op) return fail("Unknown operator."); const n = Math.max(1, Math.min(60, parseInt(args.limit, 10) || 20)); return text(JSON.stringify((op.messages || []).slice(-n).map(m => ({ role: m.role, source: m.source || "", ts: m.ts, content: String(m.content).slice(0, 2000) })))); }
+      if (p.name === "list_schedules") return text(JSON.stringify(ws.schedules.map(s => ({ id: s.id, operator: (ws.operators.find(o => o.id === s.operatorId) || {}).name, hour: s.hour, minute: s.minute, prompt: s.prompt }))));
+      if (p.name === "add_schedule") { const q = String(args.operator || "").toLowerCase(); const op = ws.operators.find(o => o.id === args.operator || o.name.toLowerCase() === q); if (!op) return fail("Unknown operator."); const sch = STORE.addSchedule(ws, { operatorId: op.id, hour: args.hour, minute: args.minute || 0, prompt: String(args.prompt || "") }); STORE.log(ws, "Claude", "scheduled " + op.name + " daily at " + sch.hour + ":" + String(sch.minute).padStart(2, "0") + " UTC"); return text("Scheduled " + op.name + " daily at " + sch.hour + ":" + String(sch.minute).padStart(2, "0") + " UTC (id " + sch.id + ")."); }
+      if (p.name === "delete_schedule") return STORE.deleteSchedule(ws, String(args.id || "")) ? text("Schedule removed.") : fail("No schedule with that id.");
+      if (p.name === "list_connections") return text(JSON.stringify((ws.connections || []).map(c => ({ service: c.service, account: c.account, usedBy: ws.operators.filter(o => (o.tools_allowed || []).some(t => t.service === c.service)).map(o => o.name) }))));
       if (p.name === "add_fact") { STORE.addFact(ws, String(args.fact || "")); return text("Saved to business memory."); }
       if (p.name === "resolve_approval") {
         const item = STORE.resolveApproval(ws, String(args.id || ""), args.decision === "approve");
