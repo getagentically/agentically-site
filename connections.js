@@ -56,9 +56,45 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
       url: env.RAILWAY_MCP_URL || "https://mcp.railway.com/mcp",
       ready: () => true,
       setup: "Connect via OAuth (dynamic registration) or paste a Railway account token"
+    },
+    stripe: {
+      label: "Stripe", type: "mcp", provider: "oauth-dcr",
+      url: env.STRIPE_MCP_URL || "https://mcp.stripe.com",
+      ready: () => true,
+      setup: "Connect via Stripe OAuth, or paste a restricted API key (Developers → API keys → Create restricted key)"
+    },
+    vercel: {
+      label: "Vercel", type: "mcp", provider: "oauth-dcr",
+      url: env.VERCEL_MCP_URL || "https://mcp.vercel.com",
+      ready: () => true,
+      setup: "Connect via Vercel OAuth, or paste a Vercel token (Account Settings → Tokens)"
+    },
+    "google-calendar": {
+      label: "Google Calendar", type: "builtin", provider: "google",
+      scopes: ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/userinfo.email"],
+      ready: () => !!(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET),
+      setup: "Same Google OAuth client; add redirect URL " + BASE_URL + "/oauth/google-calendar/callback and enable the Google Calendar API"
+    },
+    shopify: {
+      label: "Shopify", type: "builtin", provider: "token",
+      ready: () => true,
+      tokenHelp: "Shopify admin → Settings → Apps and sales channels → Develop apps → Create app → Admin API scopes (read/write products, orders, customers, inventory, discounts) → Install → copy the Admin API access token. Paste as  yourstore.myshopify.com|shpat_xxx",
+      setup: "Paste  store-domain|admin-api-token  (custom app token)"
+    },
+    "meta-ads": {
+      label: "Meta Ads", type: "builtin", provider: "token",
+      ready: () => true,
+      tokenHelp: "Meta Business Suite → Business settings → Users → System users → Add → assign ad accounts → Generate token (ads_read, ads_management). Paste the token.",
+      setup: "Paste a Meta system-user access token"
+    },
+    "post-bridge": {
+      label: "Post Bridge", type: "builtin", provider: "token",
+      ready: () => true,
+      tokenHelp: "post-bridge.com → Settings → API keys → create key. Paste the key.",
+      setup: "Paste a Post Bridge API key"
     }
   };
-  const serviceList = () => Object.entries(SERVICES).map(([id, s]) => ({ id, label: s.label, type: s.type, ready: s.ready(), setup: s.setup, tokenPaste: s.provider === "oauth-dcr" }));
+  const serviceList = () => Object.entries(SERVICES).map(([id, s]) => ({ id, label: s.label, type: s.type, ready: s.ready(), setup: s.setup, tokenHelp: s.tokenHelp || "", tokenPaste: s.provider === "oauth-dcr" || s.provider === "token", oauth: s.provider !== "token" }));
 
   /* ---------- per-workspace store ---------- */
   const wsConns = ws => (ws.connections = ws.connections || []);
@@ -66,7 +102,7 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
   function findConn(ws, service) { return wsConns(ws).find(c => c.service === service); }
   function publicConn(c, ws) {
     const users = (ws.operators || []).filter(o => (o.tools_allowed || []).some(t => t.service === c.service)).map(o => o.name);
-    return { id: c.id, service: c.service, label: (SERVICES[c.service] || {}).label || c.service, account: c.account || "", connectedBy: c.connectedBy || "", connectedAt: c.connectedAt, toolCount: (c.manifest || []).length, usedBy: users, lastError: c.lastError || "" };
+    return { id: c.id, service: c.service, label: (SERVICES[c.service] || {}).label || c.service, account: c.account || "", connectedBy: c.connectedBy || "", connectedAt: c.connectedAt, toolCount: (SERVICES[c.service] && SERVICES[c.service].type === "builtin" && BUILTIN[c.service]) ? BUILTIN[c.service].tools.length : (c.manifest || []).length, usedBy: users, lastError: c.lastError || "" };
   }
   function putConn(ws, service, { tokens, account, connectedBy, extra }) {
     wsConns(ws);
@@ -211,11 +247,28 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
     throw new Error("unsupported provider");
   }
 
-  function connectWithToken(ws, service, token) {
+  async function connectWithToken(ws, service, token) {
     const s = SERVICES[service];
-    if (!s || s.type !== "mcp") throw new Error("token paste is only for MCP services");
-    const rec = putConn(ws, service, { tokens: { access_token: String(token).trim(), refresh_token: "", expires_at: 0 }, account: "token", connectedBy: ws.email || "owner" });
-    refreshManifest(ws, rec).catch(() => {});
+    if (!s || (s.type !== "mcp" && s.provider !== "token")) throw new Error("token paste is not available for this service");
+    let tok = String(token || "").trim(), account = "token", extra = {};
+    if (service === "shopify") {
+      const m = tok.match(/^([a-z0-9][a-z0-9-]*\.myshopify\.com)\s*[|,\s]\s*(shpat_[A-Za-z0-9]+|shpca_[A-Za-z0-9]+|[A-Za-z0-9_-]{20,})$/i);
+      if (!m) throw new Error("Format: yourstore.myshopify.com|shpat_token");
+      extra = { shop: m[1].toLowerCase() }; tok = m[2]; account = extra.shop;
+      const r = await fetch("https://" + extra.shop + "/admin/api/2025-07/shop.json", { headers: { "X-Shopify-Access-Token": tok } });
+      if (!r.ok) throw new Error("Shopify rejected the token (HTTP " + r.status + ")");
+    } else if (service === "meta-ads") {
+      const r = await fetch("https://graph.facebook.com/v21.0/me?fields=id,name&access_token=" + encodeURIComponent(tok));
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.error) throw new Error("Meta rejected the token: " + ((j.error && j.error.message) || r.status));
+      account = j.name || j.id;
+    } else if (service === "post-bridge") {
+      const r = await fetch("https://api.post-bridge.com/v1/social-accounts", { headers: { authorization: "Bearer " + tok } });
+      if (!r.ok) throw new Error("Post Bridge rejected the key (HTTP " + r.status + ")");
+      account = "api key";
+    }
+    const rec = putConn(ws, service, { tokens: { access_token: tok, refresh_token: "", expires_at: 0 }, account, connectedBy: ws.email || "owner", extra });
+    if (s.type === "mcp") refreshManifest(ws, rec).catch(() => {});
     return rec;
   }
 
@@ -435,12 +488,176 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
     }
   };
 
+  /* ---------- Google Calendar ---------- */
+  BUILTIN["google-calendar"] = {
+    tools: [
+      { name: "list_events", readOnly: true, description: "List upcoming events between two ISO datetimes (defaults: now → +7 days) on the primary calendar.", input_schema: { type: "object", properties: { timeMin: { type: "string" }, timeMax: { type: "string" }, query: { type: "string" }, max: { type: "integer" } } } },
+      { name: "get_event", readOnly: true, description: "Get one event by id.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+      { name: "find_free_time", readOnly: true, description: "Return busy blocks between two ISO datetimes so you can propose free slots.", input_schema: { type: "object", properties: { timeMin: { type: "string" }, timeMax: { type: "string" } }, required: ["timeMin", "timeMax"] } },
+      { name: "create_event", readOnly: false, description: "Create an event. start/end are ISO datetimes with timezone (e.g. 2026-09-20T14:00:00-04:00).", input_schema: { type: "object", properties: { title: { type: "string" }, start: { type: "string" }, end: { type: "string" }, description: { type: "string" }, location: { type: "string" }, attendees: { type: "array", items: { type: "string" } } }, required: ["title", "start", "end"] } },
+      { name: "update_event", readOnly: false, description: "Update an event's title/time/description/location.", input_schema: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, start: { type: "string" }, end: { type: "string" }, description: { type: "string" }, location: { type: "string" } }, required: ["id"] } },
+      { name: "delete_event", readOnly: false, description: "Delete an event by id.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } }
+    ],
+    async call(ws, conn, name, a) {
+      const C = "https://www.googleapis.com/calendar/v3/calendars/primary";
+      const slim = e => ({ id: e.id, title: e.summary, start: (e.start || {}).dateTime || (e.start || {}).date, end: (e.end || {}).dateTime || (e.end || {}).date, location: e.location, description: (e.description || "").slice(0, 500), attendees: (e.attendees || []).map(x => x.email), link: e.htmlLink });
+      if (name === "list_events") {
+        const q = new URLSearchParams({ timeMin: a.timeMin || new Date().toISOString(), timeMax: a.timeMax || new Date(Date.now() + 7 * 864e5).toISOString(), singleEvents: "true", orderBy: "startTime", maxResults: String(Math.max(1, Math.min(50, parseInt(a.max, 10) || 25))) });
+        if (a.query) q.set("q", a.query);
+        return JSON.stringify(((await gapi(ws, conn, C + "/events?" + q)).items || []).map(slim));
+      }
+      if (name === "get_event") return JSON.stringify(slim(await gapi(ws, conn, C + "/events/" + encodeURIComponent(a.id))));
+      if (name === "find_free_time") {
+        const r = await gapi(ws, conn, "https://www.googleapis.com/calendar/v3/freeBusy", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ timeMin: a.timeMin, timeMax: a.timeMax, items: [{ id: "primary" }] }) });
+        return JSON.stringify({ busy: ((r.calendars || {}).primary || {}).busy || [] });
+      }
+      if (name === "create_event") {
+        const body = { summary: a.title, description: a.description, location: a.location, start: { dateTime: a.start }, end: { dateTime: a.end }, attendees: (a.attendees || []).map(email => ({ email })) };
+        const e = await gapi(ws, conn, C + "/events?sendUpdates=all", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+        return "Created event " + e.id + " — " + (e.htmlLink || "");
+      }
+      if (name === "update_event") {
+        const patch = {}; if (a.title) patch.summary = a.title; if (a.description) patch.description = a.description; if (a.location) patch.location = a.location; if (a.start) patch.start = { dateTime: a.start }; if (a.end) patch.end = { dateTime: a.end };
+        const e = await gapi(ws, conn, C + "/events/" + encodeURIComponent(a.id) + "?sendUpdates=all", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(patch) });
+        return "Updated event " + e.id;
+      }
+      if (name === "delete_event") { await gapi(ws, conn, C + "/events/" + encodeURIComponent(a.id) + "?sendUpdates=all", { method: "DELETE" }).catch(e => { if (!/204|HTTP 2/.test(e.message)) throw e; }); return "Deleted event " + a.id; }
+      throw new Error("unknown calendar tool");
+    }
+  };
+
+  /* ---------- Shopify (Admin API, custom-app token) ---------- */
+  async function shopifyApi(ws, conn, pathName, opts) {
+    const token = await accessToken(ws, conn);
+    const res = await fetch("https://" + conn.shop + "/admin/api/2025-07" + pathName, Object.assign({}, opts || {}, { headers: Object.assign({ "X-Shopify-Access-Token": token, "content-type": "application/json" }, (opts && opts.headers) || {}) }));
+    const txt = await res.text(); let j; try { j = JSON.parse(txt); } catch (e) { j = { raw: txt }; }
+    if (!res.ok) throw new Error("Shopify " + res.status + ": " + JSON.stringify(j.errors || j).slice(0, 300));
+    return j;
+  }
+  BUILTIN.shopify = {
+    tools: [
+      { name: "get_shop", readOnly: true, description: "Store name, domain, currency, plan.", input_schema: { type: "object", properties: {} } },
+      { name: "list_products", readOnly: true, description: "List products (id, title, status, variants with price/sku/inventory).", input_schema: { type: "object", properties: { query: { type: "string", description: "title contains" }, status: { type: "string", enum: ["active", "draft", "archived"] }, max: { type: "integer" } } } },
+      { name: "get_product", readOnly: true, description: "Full product by id.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+      { name: "list_orders", readOnly: true, description: "Recent orders (id, name, created, total, financial/fulfillment status, customer email, line items).", input_schema: { type: "object", properties: { status: { type: "string", enum: ["open", "closed", "cancelled", "any"] }, max: { type: "integer" }, since: { type: "string", description: "ISO date" } } } },
+      { name: "get_order", readOnly: true, description: "Full order by id.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+      { name: "list_customers", readOnly: true, description: "Recent customers (id, name, email, orders_count, total_spent).", input_schema: { type: "object", properties: { query: { type: "string" }, max: { type: "integer" } } } },
+      { name: "get_inventory", readOnly: true, description: "Inventory levels for a product's variants.", input_schema: { type: "object", properties: { productId: { type: "string" } }, required: ["productId"] } },
+      { name: "update_product", readOnly: false, description: "Update a product's title, body_html, status, tags, or a variant's price.", input_schema: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, body_html: { type: "string" }, status: { type: "string", enum: ["active", "draft", "archived"] }, tags: { type: "string" }, variantId: { type: "string" }, price: { type: "string" } }, required: ["id"] } },
+      { name: "create_product", readOnly: false, description: "Create a product (draft by default).", input_schema: { type: "object", properties: { title: { type: "string" }, body_html: { type: "string" }, price: { type: "string" }, sku: { type: "string" }, tags: { type: "string" }, status: { type: "string", enum: ["active", "draft"] } }, required: ["title"] } },
+      { name: "set_inventory", readOnly: false, description: "Set available quantity for an inventory_item at a location.", input_schema: { type: "object", properties: { inventoryItemId: { type: "string" }, locationId: { type: "string" }, available: { type: "integer" } }, required: ["inventoryItemId", "locationId", "available"] } },
+      { name: "create_discount_code", readOnly: false, description: "Create a percentage or fixed-amount discount code valid store-wide.", input_schema: { type: "object", properties: { code: { type: "string" }, valueType: { type: "string", enum: ["percentage", "fixed_amount"] }, value: { type: "number" }, startsAt: { type: "string" }, endsAt: { type: "string" }, usageLimit: { type: "integer" } }, required: ["code", "valueType", "value"] } }
+    ],
+    async call(ws, conn, name, a) {
+      const n = Math.max(1, Math.min(50, parseInt(a.max, 10) || 20));
+      if (name === "get_shop") { const s = (await shopifyApi(ws, conn, "/shop.json")).shop; return JSON.stringify({ name: s.name, domain: s.domain, myshopify: s.myshopify_domain, currency: s.currency, plan: s.plan_display_name, email: s.email }); }
+      if (name === "list_products") {
+        const q = new URLSearchParams({ limit: String(n), fields: "id,title,status,handle,tags,variants" }); if (a.status) q.set("status", a.status); if (a.query) q.set("title", a.query);
+        return JSON.stringify(((await shopifyApi(ws, conn, "/products.json?" + q)).products || []).map(p => ({ id: p.id, title: p.title, status: p.status, handle: p.handle, tags: p.tags, variants: (p.variants || []).map(v => ({ id: v.id, title: v.title, price: v.price, sku: v.sku, inventory_quantity: v.inventory_quantity, inventory_item_id: v.inventory_item_id })) })));
+      }
+      if (name === "get_product") return JSON.stringify((await shopifyApi(ws, conn, "/products/" + encodeURIComponent(a.id) + ".json")).product);
+      if (name === "list_orders") {
+        const q = new URLSearchParams({ limit: String(n), status: a.status || "any", fields: "id,name,created_at,total_price,currency,financial_status,fulfillment_status,email,line_items" }); if (a.since) q.set("created_at_min", a.since);
+        return JSON.stringify(((await shopifyApi(ws, conn, "/orders.json?" + q)).orders || []).map(o => ({ id: o.id, name: o.name, created: o.created_at, total: o.total_price + " " + o.currency, financial: o.financial_status, fulfillment: o.fulfillment_status, email: o.email, items: (o.line_items || []).map(l => l.quantity + "× " + l.title) })));
+      }
+      if (name === "get_order") return JSON.stringify((await shopifyApi(ws, conn, "/orders/" + encodeURIComponent(a.id) + ".json")).order);
+      if (name === "list_customers") {
+        const path = a.query ? "/customers/search.json?" + new URLSearchParams({ query: a.query, limit: String(n) }) : "/customers.json?" + new URLSearchParams({ limit: String(n) });
+        return JSON.stringify(((await shopifyApi(ws, conn, path)).customers || []).map(c => ({ id: c.id, name: [c.first_name, c.last_name].filter(Boolean).join(" "), email: c.email, orders: c.orders_count, spent: c.total_spent, created: c.created_at })));
+      }
+      if (name === "get_inventory") {
+        const p = (await shopifyApi(ws, conn, "/products/" + encodeURIComponent(a.productId) + ".json?fields=id,title,variants")).product;
+        const ids = (p.variants || []).map(v => v.inventory_item_id).join(",");
+        const lv = (await shopifyApi(ws, conn, "/inventory_levels.json?inventory_item_ids=" + ids)).inventory_levels || [];
+        return JSON.stringify({ product: p.title, variants: (p.variants || []).map(v => ({ variant: v.title, sku: v.sku, inventory_item_id: v.inventory_item_id, levels: lv.filter(l => l.inventory_item_id === v.inventory_item_id).map(l => ({ location_id: l.location_id, available: l.available })) })) });
+      }
+      if (name === "update_product") {
+        const product = { id: a.id }; for (const k of ["title", "body_html", "status", "tags"]) if (a[k] !== undefined) product[k] = a[k];
+        if (a.variantId && a.price) product.variants = [{ id: a.variantId, price: String(a.price) }];
+        const r = await shopifyApi(ws, conn, "/products/" + encodeURIComponent(a.id) + ".json", { method: "PUT", body: JSON.stringify({ product }) });
+        return "Updated product " + r.product.id + " (" + r.product.title + ")";
+      }
+      if (name === "create_product") {
+        const product = { title: a.title, body_html: a.body_html || "", tags: a.tags || "", status: a.status || "draft", variants: [{ price: String(a.price || "0.00"), sku: a.sku || "" }] };
+        const r = await shopifyApi(ws, conn, "/products.json", { method: "POST", body: JSON.stringify({ product }) });
+        return "Created product " + r.product.id + " (" + r.product.status + ")";
+      }
+      if (name === "set_inventory") { await shopifyApi(ws, conn, "/inventory_levels/set.json", { method: "POST", body: JSON.stringify({ inventory_item_id: a.inventoryItemId, location_id: a.locationId, available: a.available }) }); return "Inventory set to " + a.available; }
+      if (name === "create_discount_code") {
+        const pr = await shopifyApi(ws, conn, "/price_rules.json", { method: "POST", body: JSON.stringify({ price_rule: { title: a.code, target_type: "line_item", target_selection: "all", allocation_method: "across", value_type: a.valueType, value: String(-Math.abs(a.value)), customer_selection: "all", starts_at: a.startsAt || new Date().toISOString(), ends_at: a.endsAt || null, usage_limit: a.usageLimit || null } }) });
+        const dc = await shopifyApi(ws, conn, "/price_rules/" + pr.price_rule.id + "/discount_codes.json", { method: "POST", body: JSON.stringify({ discount_code: { code: a.code } }) });
+        return "Discount code " + dc.discount_code.code + " created (" + a.valueType + " " + a.value + ")";
+      }
+      throw new Error("unknown shopify tool");
+    }
+  };
+
+  /* ---------- Meta Ads (Marketing API, system-user token) ---------- */
+  async function metaApi(ws, conn, pathName, opts) {
+    const token = await accessToken(ws, conn);
+    const url = "https://graph.facebook.com/v21.0" + pathName + (pathName.includes("?") ? "&" : "?") + "access_token=" + encodeURIComponent(token);
+    const res = await fetch(url, opts || {}); const j = await res.json().catch(() => ({}));
+    if (!res.ok || j.error) throw new Error("Meta: " + ((j.error && j.error.message) || res.status));
+    return j;
+  }
+  BUILTIN["meta-ads"] = {
+    tools: [
+      { name: "list_ad_accounts", readOnly: true, description: "Ad accounts this token can see (id, name, currency, status, spend cap).", input_schema: { type: "object", properties: {} } },
+      { name: "list_campaigns", readOnly: true, description: "Campaigns in an ad account (id, name, status, objective, daily/lifetime budget).", input_schema: { type: "object", properties: { adAccountId: { type: "string", description: "act_123..." }, status: { type: "string", enum: ["ACTIVE", "PAUSED", "ALL"] } }, required: ["adAccountId"] } },
+      { name: "get_insights", readOnly: true, description: "Performance for an ad account or campaign: spend, impressions, clicks, CTR, CPC, CPM, purchases/leads, ROAS where available.", input_schema: { type: "object", properties: { id: { type: "string", description: "act_... or a campaign/adset/ad id" }, datePreset: { type: "string", enum: ["today", "yesterday", "last_7d", "last_14d", "last_30d", "this_month", "last_month"] }, level: { type: "string", enum: ["account", "campaign", "adset", "ad"] } }, required: ["id"] } },
+      { name: "list_ads", readOnly: true, description: "Ads in a campaign or ad set (id, name, status, creative id).", input_schema: { type: "object", properties: { parentId: { type: "string" } }, required: ["parentId"] } },
+      { name: "pause_campaign", readOnly: false, description: "Pause a campaign, ad set or ad by id.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+      { name: "resume_campaign", readOnly: false, description: "Set a campaign, ad set or ad ACTIVE by id.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+      { name: "update_budget", readOnly: false, description: "Change a campaign or ad set daily budget (in account currency units, e.g. 25.00).", input_schema: { type: "object", properties: { id: { type: "string" }, dailyBudget: { type: "number" } }, required: ["id", "dailyBudget"] } }
+    ],
+    async call(ws, conn, name, a) {
+      const money = v => v == null ? null : (Number(v) / 100).toFixed(2);
+      if (name === "list_ad_accounts") return JSON.stringify(((await metaApi(ws, conn, "/me/adaccounts?fields=id,name,currency,account_status,spend_cap,amount_spent&limit=50")).data || []).map(x => ({ id: x.id, name: x.name, currency: x.currency, status: x.account_status, spent: money(x.amount_spent), cap: money(x.spend_cap) })));
+      if (name === "list_campaigns") { const f = a.status && a.status !== "ALL" ? "&effective_status=" + encodeURIComponent(JSON.stringify([a.status])) : ""; return JSON.stringify(((await metaApi(ws, conn, "/" + a.adAccountId + "/campaigns?fields=id,name,status,objective,daily_budget,lifetime_budget,start_time&limit=100" + f)).data || []).map(c => ({ id: c.id, name: c.name, status: c.status, objective: c.objective, daily: money(c.daily_budget), lifetime: money(c.lifetime_budget), start: c.start_time }))); }
+      if (name === "get_insights") { const r = await metaApi(ws, conn, "/" + a.id + "/insights?date_preset=" + (a.datePreset || "last_7d") + "&level=" + (a.level || (String(a.id).startsWith("act_") ? "account" : "campaign")) + "&fields=campaign_name,spend,impressions,clicks,ctr,cpc,cpm,reach,actions,purchase_roas,cost_per_action_type&limit=50"); return JSON.stringify((r.data || []).map(d => ({ name: d.campaign_name, spend: d.spend, impressions: d.impressions, clicks: d.clicks, ctr: d.ctr, cpc: d.cpc, cpm: d.cpm, reach: d.reach, actions: (d.actions || []).filter(x => /purchase|lead|link_click|add_to_cart/.test(x.action_type)).map(x => x.action_type + ":" + x.value), roas: (d.purchase_roas || []).map(x => x.value)[0] }))); }
+      if (name === "list_ads") return JSON.stringify(((await metaApi(ws, conn, "/" + a.parentId + "/ads?fields=id,name,status,effective_status,creative{id}&limit=100")).data || []).map(x => ({ id: x.id, name: x.name, status: x.effective_status || x.status, creative: x.creative && x.creative.id })));
+      if (name === "pause_campaign" || name === "resume_campaign") { await metaApi(ws, conn, "/" + a.id, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "status=" + (name === "pause_campaign" ? "PAUSED" : "ACTIVE") }); return (name === "pause_campaign" ? "Paused " : "Activated ") + a.id; }
+      if (name === "update_budget") { await metaApi(ws, conn, "/" + a.id, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "daily_budget=" + Math.round(Number(a.dailyBudget) * 100) }); return "Daily budget for " + a.id + " set to " + Number(a.dailyBudget).toFixed(2); }
+      throw new Error("unknown meta tool");
+    }
+  };
+
+  /* ---------- Post Bridge (API key) ---------- */
+  async function pbApi(ws, conn, pathName, opts) {
+    const token = await accessToken(ws, conn);
+    const res = await fetch("https://api.post-bridge.com/v1" + pathName, Object.assign({}, opts || {}, { headers: Object.assign({ authorization: "Bearer " + token, "content-type": "application/json" }, (opts && opts.headers) || {}) }));
+    const txt = await res.text(); let j; try { j = JSON.parse(txt); } catch (e) { j = { raw: txt }; }
+    if (!res.ok) throw new Error("Post Bridge " + res.status + ": " + txt.slice(0, 300));
+    return j;
+  }
+  BUILTIN["post-bridge"] = {
+    tools: [
+      { name: "list_social_accounts", readOnly: true, description: "Connected social accounts (id, platform, username).", input_schema: { type: "object", properties: {} } },
+      { name: "list_posts", readOnly: true, description: "Recent posts (id, caption, status, scheduled time, accounts).", input_schema: { type: "object", properties: { status: { type: "string", enum: ["scheduled", "posted", "draft", "all"] }, max: { type: "integer" } } } },
+      { name: "get_post", readOnly: true, description: "One post with per-platform results.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+      { name: "get_analytics", readOnly: true, description: "Recent analytics across accounts (views, likes, comments, followers).", input_schema: { type: "object", properties: { days: { type: "integer" } } } },
+      { name: "create_post", readOnly: false, description: "Create a post (published now if no scheduledAt, otherwise scheduled) to one or more social account ids. mediaUrls are public image/video URLs.", input_schema: { type: "object", properties: { caption: { type: "string" }, socialAccountIds: { type: "array", items: { type: "string" } }, scheduledAt: { type: "string", description: "ISO datetime; omit to post now" }, mediaUrls: { type: "array", items: { type: "string" } } }, required: ["caption", "socialAccountIds"] } },
+      { name: "delete_post", readOnly: false, description: "Delete/unschedule a post by id.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } }
+    ],
+    async call(ws, conn, name, a) {
+      if (name === "list_social_accounts") { const r = await pbApi(ws, conn, "/social-accounts"); return JSON.stringify((r.data || r || []).map(x => ({ id: x.id, platform: x.platform, username: x.username || x.name }))); }
+      if (name === "list_posts") { const r = await pbApi(ws, conn, "/posts?limit=" + Math.max(1, Math.min(50, parseInt(a.max, 10) || 20)) + (a.status && a.status !== "all" ? "&status=" + a.status : "")); return JSON.stringify((r.data || r || []).map(x => ({ id: x.id, caption: String(x.caption || "").slice(0, 200), status: x.status, scheduledAt: x.scheduled_at, accounts: x.social_accounts || x.social_account_ids }))); }
+      if (name === "get_post") return JSON.stringify(await pbApi(ws, conn, "/posts/" + encodeURIComponent(a.id)));
+      if (name === "get_analytics") { const r = await pbApi(ws, conn, "/analytics?days=" + (parseInt(a.days, 10) || 7)); return JSON.stringify(r).slice(0, 8000); }
+      if (name === "create_post") { const body = { caption: a.caption, social_accounts: a.socialAccountIds }; if (a.scheduledAt) body.scheduled_at = a.scheduledAt; if (a.mediaUrls && a.mediaUrls.length) body.media = a.mediaUrls.map(url => ({ url })); const r = await pbApi(ws, conn, "/posts", { method: "POST", body: JSON.stringify(body) }); return (a.scheduledAt ? "Scheduled" : "Published") + " post " + (r.id || (r.data && r.data.id) || ""); }
+      if (name === "delete_post") { await pbApi(ws, conn, "/posts/" + encodeURIComponent(a.id), { method: "DELETE" }); return "Deleted post " + a.id; }
+      throw new Error("unknown post-bridge tool");
+    }
+  };
+
   /* ---------- read / write classification ---------- */
   const READ_RE = /^(get|list|search|read|fetch|describe|query|find|show|view|count|check|lookup|browse|whoami|preview|export)[_a-z]*/i;
   const OVERRIDES = { // hand-maintained: misnamed tools
     "github:create_pull_request_review": "write", "github:request_copilot_review": "write", "github:fork_repository": "write",
     "railway:get-deployment-diagnosis": "read", "railway:accept-deploy": "write", "railway:redeploy": "write", "railway:restart-service": "write", "railway:set-variables": "write",
-    "gmail:create_draft": "write", "gmail:save_attachment_to_drive": "write", "google-drive:create_doc": "write"
+    "gmail:create_draft": "write", "gmail:save_attachment_to_drive": "write", "google-drive:create_doc": "write",
+    "stripe:create_payment_link": "write", "stripe:create_customer": "write", "stripe:create_product": "write", "stripe:create_price": "write", "stripe:create_invoice": "write", "stripe:create_refund": "write", "stripe:finalize_invoice": "write", "stripe:cancel_subscription": "write", "stripe:update_subscription": "write", "stripe:create_coupon": "write",
+    "vercel:deploy_to_vercel": "write"
   };
   function isWrite(service, tool) {
     const o = OVERRIDES[service + ":" + tool.name];
@@ -542,18 +759,19 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
 
   /* ---------- operator scope defaults ---------- */
   const DEFAULT_SCOPES = {
-    chief: [{ service: "gmail", tools: ["search_messages", "read_message", "list_threads"] }, { service: "google-drive", tools: ["search_files", "read_file", "list_recent"] }, { service: "github", tools: ["*"] }, { service: "railway", tools: ["*"] }],
-    jennifer: [{ service: "gmail" }, { service: "google-drive" }, { service: "railway" }],
-    veronica: [{ service: "gmail" }, { service: "google-drive" }, { service: "github" }],
-    katie: [{ service: "google-drive" }, { service: "github" }], lena: [{ service: "google-drive" }],
-    brianna: [{ service: "gmail" }, { service: "google-drive" }, { service: "railway" }], elise: [{ service: "gmail" }, { service: "google-drive" }], vaughn: [{ service: "gmail" }, { service: "google-drive" }],
-    dani: [{ service: "gmail" }, { service: "google-drive" }, { service: "railway" }], trey: [{ service: "gmail" }, { service: "google-drive" }], paige: [{ service: "gmail" }, { service: "google-drive" }], quinn: [{ service: "google-drive" }],
-    nora: [{ service: "github" }, { service: "railway" }, { service: "gmail" }], felix: [{ service: "gmail" }],
-    chloe: [{ service: "google-drive" }], margo: [{ service: "google-drive" }],
-    wes: [{ service: "github" }, { service: "railway" }], grant: [{ service: "google-drive" }, { service: "gmail" }],
-    sofia: [{ service: "google-drive" }], jane: [{ service: "google-drive" }, { service: "gmail" }],
+    chief: [{ service: "gmail", tools: ["search_messages", "read_message", "list_threads"] }, { service: "google-drive", tools: ["search_files", "read_file", "list_recent"] }, { service: "google-calendar" }, { service: "github", tools: ["*"] }, { service: "railway", tools: ["*"] }, { service: "vercel" }, { service: "shopify", tools: ["get_shop", "list_products", "get_product", "list_orders", "get_order", "list_customers", "get_inventory"] }, { service: "stripe" }, { service: "meta-ads", tools: ["list_ad_accounts", "list_campaigns", "get_insights", "list_ads"] }, { service: "post-bridge", tools: ["list_social_accounts", "list_posts", "get_post", "get_analytics"] }],
+    jennifer: [{ service: "gmail" }, { service: "google-drive" }, { service: "google-calendar" }, { service: "railway" }, { service: "vercel" }],
+    veronica: [{ service: "gmail" }, { service: "google-drive" }, { service: "github" }, { service: "vercel" }, { service: "stripe" }, { service: "post-bridge" }],
+    katie: [{ service: "shopify" }, { service: "meta-ads" }, { service: "google-drive" }, { service: "post-bridge" }, { service: "github" }, { service: "vercel" }], lena: [{ service: "shopify" }, { service: "meta-ads" }, { service: "google-drive" }, { service: "post-bridge" }],
+    brianna: [{ service: "gmail" }, { service: "google-drive" }, { service: "google-calendar" }, { service: "railway" }], elise: [{ service: "gmail" }, { service: "google-drive" }, { service: "google-calendar" }], vaughn: [{ service: "gmail" }, { service: "google-drive" }, { service: "google-calendar" }],
+    dani: [{ service: "gmail" }, { service: "google-drive" }, { service: "google-calendar" }, { service: "railway" }], trey: [{ service: "gmail" }, { service: "google-drive" }, { service: "google-calendar" }], paige: [{ service: "gmail" }, { service: "google-drive" }, { service: "google-calendar" }], quinn: [{ service: "google-drive" }, { service: "meta-ads" }],
+    nora: [{ service: "github" }, { service: "railway" }, { service: "stripe" }, { service: "gmail" }], felix: [{ service: "meta-ads" }, { service: "gmail" }],
+    chloe: [{ service: "meta-ads" }, { service: "google-drive" }], margo: [{ service: "stripe" }, { service: "shopify", tools: ["get_shop", "list_products", "list_orders", "get_order", "list_customers"] }, { service: "meta-ads", tools: ["list_ad_accounts", "list_campaigns", "get_insights"] }, { service: "google-drive" }],
+    wes: [{ service: "github" }, { service: "railway" }, { service: "vercel" }], grant: [{ service: "google-drive" }, { service: "gmail" }],
+    sofia: [{ service: "post-bridge" }, { service: "google-drive" }], jane: [{ service: "post-bridge" }, { service: "google-drive" }, { service: "gmail" }],
     tina: [{ service: "google-drive" }, { service: "gmail", tools: ["search_messages", "read_message", "list_threads"] }],
-    dean: [{ service: "google-drive" }, { service: "gmail" }], owen: [{ service: "google-drive" }, { service: "gmail" }], ava: [{ service: "google-drive" }, { service: "gmail" }],
+    dean: [{ service: "google-drive" }, { service: "gmail" }, { service: "google-calendar" }], owen: [{ service: "google-drive" }, { service: "gmail" }, { service: "google-calendar" }], ava: [{ service: "google-drive" }, { service: "gmail" }, { service: "google-calendar" }],
+    adele: [{ service: "meta-ads" }], hugo: [{ service: "meta-ads" }], remy: [{ service: "meta-ads" }],
     rebecca: []
   };
   function defaultScope(op) {
@@ -564,6 +782,7 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
     let changed = false;
     for (const op of ws.operators || []) {
       if (!Array.isArray(op.tools_allowed)) { Object.assign(op, defaultScope(op)); changed = true; }
+      else { const d = defaultScope(op).tools_allowed; for (const t of d) if (!op.tools_allowed.some(x => x.service === t.service)) { op.tools_allowed.push(t); changed = true; } }
       if (!op.write_policy) { op.write_policy = "approve"; changed = true; }
     }
     if (changed) STORE.save();
@@ -599,9 +818,9 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
       res.json({ ok: !conn.lastError, error: conn.lastError || "", toolCount: (conn.manifest || []).length });
     });
     app.delete("/api/connections/:id", auth, (req, res) => res.json({ ok: removeConn(req.ws, req.params.id) }));
-    app.post("/api/connections/:service/token", auth, (req, res) => {
+    app.post("/api/connections/:service/token", auth, async (req, res) => {
       if (!ENABLED) return res.status(503).json({ error: "CONNECTIONS_KEY not set" });
-      try { const c = connectWithToken(req.ws, req.params.service, String((req.body || {}).token || "")); res.json({ ok: true, connection: publicConn(c, req.ws) }); }
+      try { const c = await connectWithToken(req.ws, req.params.service, String((req.body || {}).token || "")); res.json({ ok: true, connection: publicConn(c, req.ws) }); }
       catch (e) { res.status(400).json({ error: String(e.message) }); }
     });
     app.post("/api/connections/:service/start", auth, async (req, res) => {
@@ -645,12 +864,17 @@ label.chk{display:inline-flex;align-items:center;gap:4px;margin:2px 8px 2px 0;fo
 <main>
 <p class="note">Operators get the tools their job needs. <b>Reads are free. Writes are approved</b> — anything that sends, posts, pushes, deploys or changes a setting waits in your approvals inbox until you tap Approve.</p>
 <div id="disabled" class="card err" style="display:none">Connections are off: <code>CONNECTIONS_KEY</code> is not set on the server.</div>
+<h2>CLAUDE</h2><div class="card"><div class="t">Claude connector</div><div class="d">Lets Claude (Cowork) talk to your operators, read the request queue and add schedules. In Claude: Settings → Connectors → Add custom connector → paste this URL (no sign-in needed).</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button id="newTok">Create connector URL</button><span class="note">Each URL is a revocable token — the HQ login key is never exposed.</span></div><div id="tokOut" style="display:none;margin-top:8px"><input id="mcpUrl" readonly style="width:100%;font-size:12px"><div style="margin-top:6px"><button id="copyMcp" class="sec">Copy URL</button> <span class="note" id="copyNote">Shown once — copy it now.</span></div></div><div id="tokList" class="note" style="margin-top:8px"></div></div>
 <h2>SERVICES</h2><div class="grid" id="services"></div>
 <h2>WHO CAN USE WHAT</h2><div class="card" style="overflow:auto"><table id="ops"><thead><tr><th>Operator</th><th>Connections</th><th>Writes</th><th></th></tr></thead><tbody></tbody></table></div>
 <h2>RECENT TOOL ACTIVITY</h2><div class="card" style="overflow:auto"><table id="audit"><thead><tr><th>When</th><th>Operator</th><th>Tool</th><th>Status</th></tr></thead><tbody></tbody></table></div>
 </main>
 <script>
 const KEY=localStorage.getItem('ag_key')||'';if(!KEY)location.href='/app';
+async function loadToks(){const t=(await api('/mcp-tokens')).tokens;const el=document.getElementById('tokList');el.innerHTML=t.length?'Active connector URLs: ':'No connector URLs yet.';t.forEach(x=>{const b=document.createElement('button');b.className='bad';b.style.marginLeft='6px';b.textContent='Revoke "'+x.label+'"'+(x.lastUsed?' (used '+new Date(x.lastUsed).toLocaleDateString()+')':'');b.onclick=async()=>{if(confirm('Revoke this connector URL? Claude will lose access until you add a new one.')){await api('/mcp-tokens/'+x.id,{method:'DELETE'});loadToks()}};el.appendChild(b)})}
+document.getElementById('newTok').onclick=async()=>{const label=prompt('Name this connector (e.g. Claude desktop):','Claude')||'Claude';const r=await api('/mcp-tokens',{method:'POST',body:{label}});document.getElementById('mcpUrl').value=r.url;document.getElementById('tokOut').style.display='block';loadToks()};
+document.getElementById('copyMcp').onclick=async()=>{const v=document.getElementById('mcpUrl').value;try{await navigator.clipboard.writeText(v);document.getElementById('copyNote').textContent='Copied. Paste into Claude → Settings → Connectors → Add custom connector.'}catch(e){const i=document.getElementById('mcpUrl');i.select();document.execCommand('copy');document.getElementById('copyNote').textContent='Copied.'}};
+loadToks().catch(()=>{});
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function api(p,o){o=o||{};o.headers=Object.assign({'content-type':'application/json','x-workspace-key':KEY},o.headers||{});if(o.body&&typeof o.body!=='string')o.body=JSON.stringify(o.body);const r=await fetch('/api'+p,o);const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||j.message||('HTTP '+r.status));return j}
 let D=null;
@@ -664,8 +888,9 @@ function render(){
       '<div class="d">'+(c?('as <b>'+esc(c.account||'—')+'</b> · '+new Date(c.connectedAt).toLocaleDateString()+' · '+c.toolCount+' tools'+(c.usedBy.length?'<br>used by '+esc(c.usedBy.join(', ')):'')+(c.lastError?'<br><span class="err">'+esc(c.lastError)+'</span>':'')):(s.ready?'Ready to connect.':'Needs setup: '+esc(s.setup)))+'</div>';
     if(c){const r=document.createElement('button');r.className='sec';r.textContent='Refresh tools';r.onclick=async()=>{await api('/connections/'+c.id+'/refresh',{method:'POST'});load()};d.appendChild(r);d.appendChild(document.createTextNode(' '));
       const x=document.createElement('button');x.className='bad';x.textContent='Disconnect';x.onclick=async()=>{if(confirm('Disconnect '+s.label+'?')){await api('/connections/'+c.id,{method:'DELETE'});load()}};d.appendChild(x)}
-    else{const b=document.createElement('button');b.textContent='Connect';b.disabled=!D.enabled||!s.ready;b.onclick=async()=>{try{const r=await api('/connections/'+s.id+'/start',{method:'POST'});location.href=r.url}catch(e){if(s.tokenPaste){const t=prompt(s.label+' OAuth unavailable ('+e.message+'). Paste an API token instead:');if(t){await api('/connections/'+s.id+'/token',{method:'POST',body:{token:t}});load()}}else alert(e.message)}};d.appendChild(b);
-      if(s.tokenPaste){d.appendChild(document.createTextNode(' '));const t=document.createElement('button');t.className='sec';t.textContent='Paste token';t.disabled=!D.enabled;t.onclick=async()=>{const v=prompt('Paste a '+s.label+' API token:');if(v){await api('/connections/'+s.id+'/token',{method:'POST',body:{token:v}});load()}};d.appendChild(t)}}
+    else{const pasteTok=async()=>{const v=prompt((s.tokenHelp?s.tokenHelp+'\n\n':'')+'Paste your '+s.label+' token:');if(!v)return;try{await api('/connections/'+s.id+'/token',{method:'POST',body:{token:v}});load()}catch(e){alert(e.message)}};
+      if(s.oauth){const b=document.createElement('button');b.textContent='Connect';b.disabled=!D.enabled||!s.ready;b.onclick=async()=>{try{const r=await api('/connections/'+s.id+'/start',{method:'POST'});location.href=r.url}catch(e){if(s.tokenPaste){if(confirm(s.label+' sign-in unavailable ('+e.message+'). Paste a token instead?'))pasteTok()}else alert(e.message)}};d.appendChild(b);d.appendChild(document.createTextNode(' '))}
+      if(s.tokenPaste){const t=document.createElement('button');t.className=s.oauth?'sec':'';t.textContent=s.oauth?'Paste token':'Connect (paste token)';t.disabled=!D.enabled;t.onclick=pasteTok;d.appendChild(t)}}
     sv.appendChild(d)});
   const tb=document.querySelector('#ops tbody');tb.innerHTML='';
   D.operators.forEach(o=>{const tr=document.createElement('tr');
