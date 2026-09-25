@@ -1,0 +1,203 @@
+From d124d2a9caeabd0ac528de30f3572d04ec7559eb Mon Sep 17 00:00:00 2001
+From: "Claude (for Jeremy Rabin)" <jeremybrandonrabin@gmail.com>
+Date: Thu, 24 Sep 2026 20:08:55 -0400
+Subject: [PATCH] Trusted connector relay, dead-token detection + Reconnect,
+ weekday schedules
+
+- talk_to_operator via a connector token now reaches the operator as [OWNER via connector "<label>"]; system prompt rule 9 (CHANNELS) tells operators a connector token IS the owner's authorisation, so no more "unverified relay" refusals.
+- connections.js: a failed refresh (invalid_grant / expired / revoked) flags the connection needsReauth once, logs it to activity, and returns a plain "owner must reconnect X in Settings > Connections" error instead of retrying; reconnecting clears the flag. Twice-daily token sweep surfaces dead tokens before an operator hits them. UI shows a red "needs reconnect" pill and a Reconnect button. list_connections (MCP) and /api/connections expose status.
+- schedules: optional days[] (0=Sun..6=Sat, UTC) on POST /api/schedules and MCP add_schedule; list_schedules shows days.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018kcCA1ESAHa7LVFQZh8nah
+---
+ connections.js | 50 +++++++++++++++++++++++++++++++++++++++++---------
+ server.js      | 24 ++++++++++++++----------
+ 2 files changed, 55 insertions(+), 19 deletions(-)
+
+diff --git a/connections.js b/connections.js
+index 146de2e..36d5f2c 100644
+--- a/connections.js
++++ b/connections.js
+@@ -102,13 +102,13 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
+   function findConn(ws, service) { return wsConns(ws).find(c => c.service === service); }
+   function publicConn(c, ws) {
+     const users = (ws.operators || []).filter(o => (o.tools_allowed || []).some(t => t.service === c.service)).map(o => o.name);
+-    return { id: c.id, service: c.service, label: (SERVICES[c.service] || {}).label || c.service, account: c.account || "", connectedBy: c.connectedBy || "", connectedAt: c.connectedAt, toolCount: (SERVICES[c.service] && SERVICES[c.service].type === "builtin" && BUILTIN[c.service]) ? BUILTIN[c.service].tools.length : (c.manifest || []).length, usedBy: users, lastError: c.lastError || "" };
++    return { id: c.id, service: c.service, label: (SERVICES[c.service] || {}).label || c.service, account: c.account || "", connectedBy: c.connectedBy || "", connectedAt: c.connectedAt, needsReauth: !!c.needsReauth, toolCount: (SERVICES[c.service] && SERVICES[c.service].type === "builtin" && BUILTIN[c.service]) ? BUILTIN[c.service].tools.length : (c.manifest || []).length, usedBy: users, lastError: c.lastError || "" };
+   }
+   function putConn(ws, service, { tokens, account, connectedBy, extra }) {
+     wsConns(ws);
+     const existing = findConn(ws, service);
+     const rec = Object.assign(existing || { id: STORE.id("cn"), service, connectedAt: STORE.now() }, {
+-      tokens: enc(tokens), account: account || (existing && existing.account) || "", connectedBy: connectedBy || "", manifest: existing ? existing.manifest : [], manifestAt: existing ? existing.manifestAt : null, lastError: ""
++      tokens: enc(tokens), account: account || (existing && existing.account) || "", connectedBy: connectedBy || "", manifest: existing ? existing.manifest : [], manifestAt: existing ? existing.manifestAt : null, lastError: "", needsReauth: false
+     }, extra || {});
+     if (!existing) ws.connections.push(rec);
+     STORE.log(ws, "You", "connected " + ((SERVICES[service] || {}).label || service) + (rec.account ? " as " + rec.account : ""));
+@@ -294,19 +294,50 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
+       t = Object.assign(t, nt); conn.tokens = enc(t); STORE.save();
+       return t.access_token;
+     }
++    if (conn.needsReauth) throw reauthError(conn);
+     if (t.expires_at && Date.now() > t.expires_at - 60000 && t.refresh_token) {
+       const s = SERVICES[conn.service];
+       let nt;
+-      if (s.provider === "google") nt = await postForm(GOOGLE_TOKEN, { refresh_token: t.refresh_token, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, grant_type: "refresh_token" });
+-      else if (s.provider === "github") nt = await postForm("https://github.com/login/oauth/access_token", { refresh_token: t.refresh_token, client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, grant_type: "refresh_token" });
+-      else if (t.tokenEndpoint) nt = await postForm(t.tokenEndpoint, { grant_type: "refresh_token", refresh_token: t.refresh_token, client_id: t.clientId });
++      try {
++        if (s.provider === "google") nt = await postForm(GOOGLE_TOKEN, { refresh_token: t.refresh_token, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, grant_type: "refresh_token" });
++        else if (s.provider === "github") nt = await postForm("https://github.com/login/oauth/access_token", { refresh_token: t.refresh_token, client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, grant_type: "refresh_token" });
++        else if (t.tokenEndpoint) nt = await postForm(t.tokenEndpoint, { grant_type: "refresh_token", refresh_token: t.refresh_token, client_id: t.clientId });
++      } catch (e) {
++        // A dead refresh token (Google: invalid_grant "expired or revoked" — e.g. an OAuth app still in Testing mode
++        // expires refresh tokens after 7 days) cannot be recovered server-side. Flag it once, loudly, and stop retrying.
++        if (/invalid_grant|expired|revoked|invalid_token|unauthorized/i.test(String(e.message))) { markReauth(conn, e.message); throw reauthError(conn); }
++        throw e;
++      }
+       if (nt && nt.access_token) {
+         t = Object.assign(t, { access_token: nt.access_token, refresh_token: nt.refresh_token || t.refresh_token, expires_at: nt.expires_in ? Date.now() + nt.expires_in * 1000 : 0 });
+-        conn.tokens = enc(t); STORE.save();
++        conn.tokens = enc(t); conn.needsReauth = false; conn.lastError = ""; STORE.save();
+       }
+     }
+     return t.access_token;
+   }
++  function markReauth(conn, why) {
++    if (!conn.needsReauth) {
++      const ws = Object.values(STORE.state().workspaces).find(w => (w.connections || []).includes(conn));
++      if (ws) STORE.log(ws, "System", ((SERVICES[conn.service] || {}).label || conn.service) + " needs reconnecting (" + String(why).slice(0, 80) + ")");
++    }
++    conn.needsReauth = true; conn.lastError = "Needs reconnect: " + String(why).slice(0, 160); conn.reauthAt = STORE.now(); STORE.save();
++  }
++  function reauthError(conn) {
++    const label = (SERVICES[conn.service] || {}).label || conn.service;
++    return new Error(label + " is connected but its sign-in has expired or been revoked. The owner must reconnect " + label + " in Settings > Connections (one click, then Google sign-in). Do not retry; tell the owner exactly this.");
++  }
++  // Daily sweep: try to refresh every OAuth connection so the owner sees "needs reconnect" before an operator hits it.
++  async function sweepTokens() {
++    for (const ws of Object.values(STORE.state().workspaces)) {
++      for (const conn of ws.connections || []) {
++        if (conn.needsReauth) continue;
++        let t; try { t = dec(conn.tokens); } catch (e) { continue; }
++        if (!t || !t.refresh_token) continue;
++        try { t.expires_at = 1; conn.tokens = enc(t); await accessToken(ws, conn); } catch (e) {}
++      }
++    }
++  }
++  setTimeout(() => { sweepTokens().catch(() => {}); setInterval(() => sweepTokens().catch(() => {}), 12 * 3600 * 1000); }, 90 * 1000);
+ 
+   /* ---------- MCP client (Streamable HTTP) ---------- */
+   const sessions = new Map(); // connId -> Mcp-Session-Id
+@@ -904,9 +935,10 @@ function render(){
+   const q=new URLSearchParams(location.search);if(q.get('connected'))document.getElementById('status').textContent='Connected '+q.get('connected')+' ✓';
+   const sv=document.getElementById('services');sv.innerHTML='';
+   D.services.forEach(s=>{const c=D.connections.find(x=>x.service===s.id);const d=document.createElement('div');d.className='card';
+-    d.innerHTML='<div class="t">'+esc(s.label)+' '+(c?'<span class="pill on">connected</span>':'<span class="pill">not connected</span>')+'</div>'+
++    d.innerHTML='<div class="t">'+esc(s.label)+' '+(c?(c.needsReauth?'<span class="pill" style="border-color:#ff6b6b;color:#ff6b6b">needs reconnect</span>':'<span class="pill on">connected</span>'):'<span class="pill">not connected</span>')+'</div>'+
+       '<div class="d">'+(c?('as <b>'+esc(c.account||'—')+'</b> · '+new Date(c.connectedAt).toLocaleDateString()+' · '+c.toolCount+' tools'+(c.usedBy.length?'<br>used by '+esc(c.usedBy.join(', ')):'')+(c.lastError?'<br><span class="err">'+esc(c.lastError)+'</span>':'')):(s.ready?'Ready to connect.':'Needs setup: '+esc(s.setup)))+'</div>';
+-    if(c){const r=document.createElement('button');r.className='sec';r.textContent='Refresh tools';r.onclick=async()=>{await api('/connections/'+c.id+'/refresh',{method:'POST'});load()};d.appendChild(r);d.appendChild(document.createTextNode(' '));
++    if(c){if(c.needsReauth&&s.oauth){const rc=document.createElement('button');rc.textContent='Reconnect';rc.onclick=async()=>{try{const r=await api('/connections/'+s.id+'/start',{method:'POST'});location.href=r.url}catch(e){alert(e.message)}};d.appendChild(rc);d.appendChild(document.createTextNode(' '))}
++      const r=document.createElement('button');r.className='sec';r.textContent='Refresh tools';r.onclick=async()=>{await api('/connections/'+c.id+'/refresh',{method:'POST'});load()};d.appendChild(r);d.appendChild(document.createTextNode(' '));
+       const x=document.createElement('button');x.className='bad';x.textContent='Disconnect';x.onclick=async()=>{if(confirm('Disconnect '+s.label+'?')){await api('/connections/'+c.id,{method:'DELETE'});load()}};d.appendChild(x)}
+     else{const pasteTok=async()=>{const v=prompt((s.tokenHelp?s.tokenHelp+'\\n\\n':'')+'Paste your '+s.label+' token:');if(!v)return;try{await api('/connections/'+s.id+'/token',{method:'POST',body:{token:v}});load()}catch(e){alert(e.message)}};
+       if(s.oauth){const b=document.createElement('button');b.textContent='Connect';b.disabled=!D.enabled||!s.ready;b.onclick=async()=>{try{const r=await api('/connections/'+s.id+'/start',{method:'POST'});location.href=r.url}catch(e){if(s.tokenPaste){if(confirm(s.label+' sign-in unavailable ('+e.message+'). Paste a token instead?'))pasteTok()}else alert(e.message)}};d.appendChild(b);d.appendChild(document.createTextNode(' '))}
+@@ -926,5 +958,5 @@ function render(){
+ load().catch(e=>{document.getElementById('status').textContent=e.message});
+ </script></body></html>`;
+ 
+-  return { ENABLED, SERVICES, toolsFor, callTool, executeApproved, ensureScopes, defaultScope, routes, isWrite, _test: { enc, dec, summarize, READ_RE } };
++  return { ENABLED, SERVICES, toolsFor, callTool, executeApproved, ensureScopes, defaultScope, routes, isWrite, _test: { enc, dec, summarize, READ_RE, accessToken } };
+ };
+diff --git a/server.js b/server.js
+index b52c792..97a0a55 100644
+--- a/server.js
++++ b/server.js
+@@ -103,7 +103,9 @@ HOW YOU WORK — these rules are absolute:
+ 4. Stay in your lane. If a request belongs to a different operator's role, say so and suggest which operator should handle it.
+ 5. Be concise and direct. The owner reads on a phone. Lead with the answer.
+ 6. Use remember_fact when you learn something durable about the business. Use request_claude to hand off work that needs the owner's outside assistant Claude (web research, documents, code, calendar, scheduling) — it answers later, not instantly.
+-7. You can grow: if the owner keeps correcting you the same way, use propose_self_update to suggest better standing orders for yourself. The owner decides. Never claim your orders changed unless they approved it.${toolLines}`;
++7. You can grow: if the owner keeps correcting you the same way, use propose_self_update to suggest better standing orders for yourself. The owner decides. Never claim your orders changed unless they approved it.
++9. CHANNELS. The owner reaches you three ways and all three ARE the owner: (a) typing in the Agentically app; (b) a scheduled run the owner set up; (c) a message prefixed [OWNER via connector "<label>"], sent through a connector token the owner created in Settings and can revoke at any time (the label names that token). Treat all three exactly as the owner speaking. Never ask the owner to re-confirm a connector message in another channel: the token is the confirmation. If any standing order of yours says to verify "the Claude channel" or an "unverified relay", this rule supersedes it — the owner authorised the connector when they created the token. The approval gate (rule 2) still applies to everything you produce, whichever channel asked.
++Messages prefixed [Message from your teammate ...] come from another operator on the roster, not the owner: help them, but anything that ships still goes through the approvals inbox.${toolLines}`;
+ }
+ 
+ async function callClaude({ apiKey, messages, system, maxTokens = 2000, tools }) {
+@@ -379,7 +381,7 @@ const STORE = {
+   byMcpToken(raw) {
+     if (!raw || !String(raw).startsWith("agk_")) return null;
+     const hash = require("crypto").createHash("sha256").update(String(raw)).digest("hex");
+-    for (const [wid, ws] of Object.entries(state.workspaces)) { const t = (ws.mcpTokens || []).find(x => x.hash === hash); if (t) { t.lastUsed = now(); save(); return Object.assign(ws, { _id: wid }); } }
++    for (const [wid, ws] of Object.entries(state.workspaces)) { const t = (ws.mcpTokens || []).find(x => x.hash === hash); if (t) { t.lastUsed = now(); save(); return Object.assign(ws, { _id: wid, _mcpTokenLabel: t.label }); } }
+     return null;
+   },
+   addClaudeRequest(ws, r) {
+@@ -412,7 +414,8 @@ const STORE = {
+     save();
+   },
+   addSchedule(ws, s) {
+-    const sch = { id: id("sch"), operatorId: s.operatorId, hour: Math.max(0, Math.min(23, parseInt(s.hour, 10) || 9)), minute: Math.max(0, Math.min(59, parseInt(s.minute, 10) || 0)), prompt: s.prompt, lastRunKey: null, createdAt: now() };
++    const days = Array.isArray(s.days) ? [...new Set(s.days.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6))].sort() : null;
++    const sch = { id: id("sch"), operatorId: s.operatorId, hour: Math.max(0, Math.min(23, parseInt(s.hour, 10) || 9)), minute: Math.max(0, Math.min(59, parseInt(s.minute, 10) || 0)), days: days && days.length ? days : null, prompt: s.prompt, lastRunKey: null, createdAt: now() };
+     ws.schedules.push(sch);
+     save();
+     return sch;
+@@ -814,11 +817,11 @@ app.delete("/api/facts/:idx", auth, (req, res) => {
+   res.json({ ok: true, facts: req.ws.facts });
+ });
+ app.post("/api/schedules", auth, (req, res) => {
+-  const { operatorId, hour, minute, prompt } = req.body || {};
++  const { operatorId, hour, minute, prompt, days } = req.body || {};
+   const op = req.ws.operators.find(o => o.id === operatorId);
+   if (!op) return res.status(400).json({ error: "unknown operator" });
+   if (!prompt) return res.status(400).json({ error: "prompt required" });
+-  const sch = STORE.addSchedule(req.ws, { operatorId, hour, minute, prompt });
++  const sch = STORE.addSchedule(req.ws, { operatorId, hour, minute, prompt, days });
+   STORE.log(req.ws, "System", "scheduled " + op.name + " daily at " + String(sch.hour).padStart(2, "0") + ":" + String(sch.minute).padStart(2, "0") + " UTC");
+   res.json({ schedule: sch });
+ });
+@@ -843,6 +846,7 @@ setInterval(async () => {
+     if (ws.plan === "canceled") continue;
+     for (const sch of ws.schedules || []) {
+       if (sch.hour !== d.getUTCHours() || sch.minute !== d.getUTCMinutes() || sch.lastRunKey === key) continue;
++      if (Array.isArray(sch.days) && sch.days.length && !sch.days.includes(d.getUTCDay())) continue;
+       sch.lastRunKey = key; STORE.save();
+       const op = ws.operators.find(o => o.id === sch.operatorId);
+       if (!op) continue;
+@@ -967,7 +971,7 @@ const MCP_TOOLS = [
+   { name: "post_claude_result", description: "Post Claude's result for a queued request. Marks it done (or declined) and delivers the result into the requesting operator's thread so it can continue.", inputSchema: { type: "object", properties: { id: { type: "string" }, result: { type: "string" }, status: { type: "string", enum: ["done", "declined"] } }, required: ["id", "result"] } },
+   { name: "get_operator_thread", description: "Read an operator's recent conversation (last N messages) for context.", inputSchema: { type: "object", properties: { operator: { type: "string" }, limit: { type: "integer" } }, required: ["operator"] } },
+   { name: "list_schedules", description: "List scheduled operator runs (id, operator, hour, minute UTC, prompt).", inputSchema: { type: "object", properties: {} } },
+-  { name: "add_schedule", description: "Schedule an operator to run a prompt daily at hour:minute (UTC). Use when the owner asks Claude to put something on an operator's schedule.", inputSchema: { type: "object", properties: { operator: { type: "string" }, hour: { type: "integer" }, minute: { type: "integer" }, prompt: { type: "string" } }, required: ["operator", "hour", "prompt"] } },
++  { name: "add_schedule", description: "Schedule an operator to run a prompt at hour:minute (UTC), every day or only on given days of the week. Use when the owner asks Claude to put something on an operator's schedule.", inputSchema: { type: "object", properties: { operator: { type: "string" }, hour: { type: "integer" }, minute: { type: "integer" }, days: { type: "array", items: { type: "integer" }, description: "Optional days of week, 0=Sunday..6=Saturday (UTC). Omit for every day. Weekdays = [1,2,3,4,5]." }, prompt: { type: "string" } }, required: ["operator", "hour", "prompt"] } },
+   { name: "delete_schedule", description: "Remove a scheduled operator run by id.", inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+   { name: "list_connections", description: "List connected services and which operators may use them.", inputSchema: { type: "object", properties: {} } }
+ ];
+@@ -994,10 +998,10 @@ app.post("/mcp/:wskey", async (req, res) => {
+       if (p.name === "list_claude_requests") { const st = args.status || "pending"; return text(JSON.stringify((ws.claudeRequests || []).filter(r => st === "all" || r.status === st).slice(0, 50).map(r => ({ id: r.id, operator: r.operatorName, task: r.task, context: r.context, status: r.status, createdAt: r.createdAt, result: r.result })))); }
+       if (p.name === "post_claude_result") { const rq = STORE.resolveClaudeRequest(ws, String(args.id || ""), String(args.result || ""), args.status); return rq ? text("Delivered to " + rq.operatorName + "'s thread (request " + rq.id + " " + rq.status + ").") : fail("No pending request with that id."); }
+       if (p.name === "get_operator_thread") { const q = String(args.operator || "").toLowerCase(); const op = ws.operators.find(o => o.id === args.operator || o.name.toLowerCase() === q); if (!op) return fail("Unknown operator."); const n = Math.max(1, Math.min(60, parseInt(args.limit, 10) || 20)); return text(JSON.stringify((op.messages || []).slice(-n).map(m => ({ role: m.role, source: m.source || "", ts: m.ts, content: String(m.content).slice(0, 2000) })))); }
+-      if (p.name === "list_schedules") return text(JSON.stringify(ws.schedules.map(s => ({ id: s.id, operator: (ws.operators.find(o => o.id === s.operatorId) || {}).name, hour: s.hour, minute: s.minute, prompt: s.prompt }))));
+-      if (p.name === "add_schedule") { const q = String(args.operator || "").toLowerCase(); const op = ws.operators.find(o => o.id === args.operator || o.name.toLowerCase() === q); if (!op) return fail("Unknown operator."); const sch = STORE.addSchedule(ws, { operatorId: op.id, hour: args.hour, minute: args.minute || 0, prompt: String(args.prompt || "") }); STORE.log(ws, "Claude", "scheduled " + op.name + " daily at " + sch.hour + ":" + String(sch.minute).padStart(2, "0") + " UTC"); return text("Scheduled " + op.name + " daily at " + sch.hour + ":" + String(sch.minute).padStart(2, "0") + " UTC (id " + sch.id + ")."); }
++      if (p.name === "list_schedules") return text(JSON.stringify(ws.schedules.map(s => ({ id: s.id, operator: (ws.operators.find(o => o.id === s.operatorId) || {}).name, hour: s.hour, minute: s.minute, days: s.days || "daily", prompt: s.prompt }))));
++      if (p.name === "add_schedule") { const q = String(args.operator || "").toLowerCase(); const op = ws.operators.find(o => o.id === args.operator || o.name.toLowerCase() === q); if (!op) return fail("Unknown operator."); const sch = STORE.addSchedule(ws, { operatorId: op.id, hour: args.hour, minute: args.minute || 0, days: args.days, prompt: String(args.prompt || "") }); const when = (sch.days ? "on days " + sch.days.join(",") + " (0=Sun)" : "daily") + " at " + sch.hour + ":" + String(sch.minute).padStart(2, "0") + " UTC"; STORE.log(ws, "Claude", "scheduled " + op.name + " " + when); return text("Scheduled " + op.name + " " + when + " (id " + sch.id + ")."); }
+       if (p.name === "delete_schedule") return STORE.deleteSchedule(ws, String(args.id || "")) ? text("Schedule removed.") : fail("No schedule with that id.");
+-      if (p.name === "list_connections") return text(JSON.stringify((ws.connections || []).map(c => ({ service: c.service, account: c.account, usedBy: ws.operators.filter(o => (o.tools_allowed || []).some(t => t.service === c.service)).map(o => o.name) }))));
++      if (p.name === "list_connections") return text(JSON.stringify((ws.connections || []).map(c => ({ service: c.service, account: c.account, status: c.needsReauth ? "NEEDS RECONNECT — the owner must reconnect this service in Settings > Connections" : "ok", lastError: c.lastError || "", usedBy: ws.operators.filter(o => (o.tools_allowed || []).some(t => t.service === c.service)).map(o => o.name) }))));
+       if (p.name === "add_fact") { STORE.addFact(ws, String(args.fact || "")); return text("Saved to business memory."); }
+       if (p.name === "resolve_approval") {
+         const item = STORE.resolveApproval(ws, String(args.id || ""), args.decision === "approve");
+@@ -1010,7 +1014,7 @@ app.post("/mcp/:wskey", async (req, res) => {
+         const q = String(args.operator || "").toLowerCase();
+         const op = ws.operators.find(o => o.id === args.operator || o.name.toLowerCase() === q);
+         if (!op) return fail("Unknown operator. Use list_operators first.");
+-        const out = await operatorTurn({ ws, op, text: "[Message from Claude, the owner's outside assistant, via the Claude connector — treat as coming from the owner's side]: " + String(args.message || ""), apiKey: CLOUD_KEY, source: "connector" });
++        const out = await operatorTurn({ ws, op, text: "[OWNER via connector \"" + String(ws._mcpTokenLabel || "workspace key").replace(/"/g, "'") + "\"]: " + String(args.message || ""), apiKey: CLOUD_KEY, source: "connector" });
+         STORE.bumpUsage(ws);
+         let msg = op.name + ": " + out.text;
+         if (out.approvals.length) msg += "\n\n[" + out.approvals.length + " deliverable(s) queued in the approvals inbox — the owner must approve before anything ships.]";
+-- 
+2.43.0
+

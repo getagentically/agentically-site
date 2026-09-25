@@ -102,13 +102,13 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
   function findConn(ws, service) { return wsConns(ws).find(c => c.service === service); }
   function publicConn(c, ws) {
     const users = (ws.operators || []).filter(o => (o.tools_allowed || []).some(t => t.service === c.service)).map(o => o.name);
-    return { id: c.id, service: c.service, label: (SERVICES[c.service] || {}).label || c.service, account: c.account || "", connectedBy: c.connectedBy || "", connectedAt: c.connectedAt, toolCount: (SERVICES[c.service] && SERVICES[c.service].type === "builtin" && BUILTIN[c.service]) ? BUILTIN[c.service].tools.length : (c.manifest || []).length, usedBy: users, lastError: c.lastError || "" };
+    return { id: c.id, service: c.service, label: (SERVICES[c.service] || {}).label || c.service, account: c.account || "", connectedBy: c.connectedBy || "", connectedAt: c.connectedAt, needsReauth: !!c.needsReauth, toolCount: (SERVICES[c.service] && SERVICES[c.service].type === "builtin" && BUILTIN[c.service]) ? BUILTIN[c.service].tools.length : (c.manifest || []).length, usedBy: users, lastError: c.lastError || "" };
   }
   function putConn(ws, service, { tokens, account, connectedBy, extra }) {
     wsConns(ws);
     const existing = findConn(ws, service);
     const rec = Object.assign(existing || { id: STORE.id("cn"), service, connectedAt: STORE.now() }, {
-      tokens: enc(tokens), account: account || (existing && existing.account) || "", connectedBy: connectedBy || "", manifest: existing ? existing.manifest : [], manifestAt: existing ? existing.manifestAt : null, lastError: ""
+      tokens: enc(tokens), account: account || (existing && existing.account) || "", connectedBy: connectedBy || "", manifest: existing ? existing.manifest : [], manifestAt: existing ? existing.manifestAt : null, lastError: "", needsReauth: false
     }, extra || {});
     if (!existing) ws.connections.push(rec);
     STORE.log(ws, "You", "connected " + ((SERVICES[service] || {}).label || service) + (rec.account ? " as " + rec.account : ""));
@@ -294,19 +294,50 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
       t = Object.assign(t, nt); conn.tokens = enc(t); STORE.save();
       return t.access_token;
     }
+    if (conn.needsReauth) throw reauthError(conn);
     if (t.expires_at && Date.now() > t.expires_at - 60000 && t.refresh_token) {
       const s = SERVICES[conn.service];
       let nt;
-      if (s.provider === "google") nt = await postForm(GOOGLE_TOKEN, { refresh_token: t.refresh_token, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, grant_type: "refresh_token" });
-      else if (s.provider === "github") nt = await postForm("https://github.com/login/oauth/access_token", { refresh_token: t.refresh_token, client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, grant_type: "refresh_token" });
-      else if (t.tokenEndpoint) nt = await postForm(t.tokenEndpoint, { grant_type: "refresh_token", refresh_token: t.refresh_token, client_id: t.clientId });
+      try {
+        if (s.provider === "google") nt = await postForm(GOOGLE_TOKEN, { refresh_token: t.refresh_token, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, grant_type: "refresh_token" });
+        else if (s.provider === "github") nt = await postForm("https://github.com/login/oauth/access_token", { refresh_token: t.refresh_token, client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, grant_type: "refresh_token" });
+        else if (t.tokenEndpoint) nt = await postForm(t.tokenEndpoint, { grant_type: "refresh_token", refresh_token: t.refresh_token, client_id: t.clientId });
+      } catch (e) {
+        // A dead refresh token (Google: invalid_grant "expired or revoked" — e.g. an OAuth app still in Testing mode
+        // expires refresh tokens after 7 days) cannot be recovered server-side. Flag it once, loudly, and stop retrying.
+        if (/invalid_grant|expired|revoked|invalid_token|unauthorized/i.test(String(e.message))) { markReauth(conn, e.message); throw reauthError(conn); }
+        throw e;
+      }
       if (nt && nt.access_token) {
         t = Object.assign(t, { access_token: nt.access_token, refresh_token: nt.refresh_token || t.refresh_token, expires_at: nt.expires_in ? Date.now() + nt.expires_in * 1000 : 0 });
-        conn.tokens = enc(t); STORE.save();
+        conn.tokens = enc(t); conn.needsReauth = false; conn.lastError = ""; STORE.save();
       }
     }
     return t.access_token;
   }
+  function markReauth(conn, why) {
+    if (!conn.needsReauth) {
+      const ws = Object.values(STORE.state().workspaces).find(w => (w.connections || []).includes(conn));
+      if (ws) STORE.log(ws, "System", ((SERVICES[conn.service] || {}).label || conn.service) + " needs reconnecting (" + String(why).slice(0, 80) + ")");
+    }
+    conn.needsReauth = true; conn.lastError = "Needs reconnect: " + String(why).slice(0, 160); conn.reauthAt = STORE.now(); STORE.save();
+  }
+  function reauthError(conn) {
+    const label = (SERVICES[conn.service] || {}).label || conn.service;
+    return new Error(label + " is connected but its sign-in has expired or been revoked. The owner must reconnect " + label + " in Settings > Connections (one click, then Google sign-in). Do not retry; tell the owner exactly this.");
+  }
+  // Daily sweep: try to refresh every OAuth connection so the owner sees "needs reconnect" before an operator hits it.
+  async function sweepTokens() {
+    for (const ws of Object.values(STORE.state().workspaces)) {
+      for (const conn of ws.connections || []) {
+        if (conn.needsReauth) continue;
+        let t; try { t = dec(conn.tokens); } catch (e) { continue; }
+        if (!t || !t.refresh_token) continue;
+        try { t.expires_at = 1; conn.tokens = enc(t); await accessToken(ws, conn); } catch (e) {}
+      }
+    }
+  }
+  setTimeout(() => { sweepTokens().catch(() => {}); setInterval(() => sweepTokens().catch(() => {}), 12 * 3600 * 1000); }, 90 * 1000);
 
   /* ---------- MCP client (Streamable HTTP) ---------- */
   const sessions = new Map(); // connId -> Mcp-Session-Id
@@ -904,9 +935,10 @@ function render(){
   const q=new URLSearchParams(location.search);if(q.get('connected'))document.getElementById('status').textContent='Connected '+q.get('connected')+' ✓';
   const sv=document.getElementById('services');sv.innerHTML='';
   D.services.forEach(s=>{const c=D.connections.find(x=>x.service===s.id);const d=document.createElement('div');d.className='card';
-    d.innerHTML='<div class="t">'+esc(s.label)+' '+(c?'<span class="pill on">connected</span>':'<span class="pill">not connected</span>')+'</div>'+
+    d.innerHTML='<div class="t">'+esc(s.label)+' '+(c?(c.needsReauth?'<span class="pill" style="border-color:#ff6b6b;color:#ff6b6b">needs reconnect</span>':'<span class="pill on">connected</span>'):'<span class="pill">not connected</span>')+'</div>'+
       '<div class="d">'+(c?('as <b>'+esc(c.account||'—')+'</b> · '+new Date(c.connectedAt).toLocaleDateString()+' · '+c.toolCount+' tools'+(c.usedBy.length?'<br>used by '+esc(c.usedBy.join(', ')):'')+(c.lastError?'<br><span class="err">'+esc(c.lastError)+'</span>':'')):(s.ready?'Ready to connect.':'Needs setup: '+esc(s.setup)))+'</div>';
-    if(c){const r=document.createElement('button');r.className='sec';r.textContent='Refresh tools';r.onclick=async()=>{await api('/connections/'+c.id+'/refresh',{method:'POST'});load()};d.appendChild(r);d.appendChild(document.createTextNode(' '));
+    if(c){if(c.needsReauth&&s.oauth){const rc=document.createElement('button');rc.textContent='Reconnect';rc.onclick=async()=>{try{const r=await api('/connections/'+s.id+'/start',{method:'POST'});location.href=r.url}catch(e){alert(e.message)}};d.appendChild(rc);d.appendChild(document.createTextNode(' '))}
+      const r=document.createElement('button');r.className='sec';r.textContent='Refresh tools';r.onclick=async()=>{await api('/connections/'+c.id+'/refresh',{method:'POST'});load()};d.appendChild(r);d.appendChild(document.createTextNode(' '));
       const x=document.createElement('button');x.className='bad';x.textContent='Disconnect';x.onclick=async()=>{if(confirm('Disconnect '+s.label+'?')){await api('/connections/'+c.id,{method:'DELETE'});load()}};d.appendChild(x)}
     else{const pasteTok=async()=>{const v=prompt((s.tokenHelp?s.tokenHelp+'\\n\\n':'')+'Paste your '+s.label+' token:');if(!v)return;try{await api('/connections/'+s.id+'/token',{method:'POST',body:{token:v}});load()}catch(e){alert(e.message)}};
       if(s.oauth){const b=document.createElement('button');b.textContent='Connect';b.disabled=!D.enabled||!s.ready;b.onclick=async()=>{try{const r=await api('/connections/'+s.id+'/start',{method:'POST'});location.href=r.url}catch(e){if(s.tokenPaste){if(confirm(s.label+' sign-in unavailable ('+e.message+'). Paste a token instead?'))pasteTok()}else alert(e.message)}};d.appendChild(b);d.appendChild(document.createTextNode(' '))}
@@ -926,5 +958,5 @@ function render(){
 load().catch(e=>{document.getElementById('status').textContent=e.message});
 </script></body></html>`;
 
-  return { ENABLED, SERVICES, toolsFor, callTool, executeApproved, ensureScopes, defaultScope, routes, isWrite, _test: { enc, dec, summarize, READ_RE } };
+  return { ENABLED, SERVICES, toolsFor, callTool, executeApproved, ensureScopes, defaultScope, routes, isWrite, _test: { enc, dec, summarize, READ_RE, accessToken } };
 };

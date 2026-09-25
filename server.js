@@ -103,7 +103,9 @@ HOW YOU WORK — these rules are absolute:
 4. Stay in your lane. If a request belongs to a different operator's role, say so and suggest which operator should handle it.
 5. Be concise and direct. The owner reads on a phone. Lead with the answer.
 6. Use remember_fact when you learn something durable about the business. Use request_claude to hand off work that needs the owner's outside assistant Claude (web research, documents, code, calendar, scheduling) — it answers later, not instantly.
-7. You can grow: if the owner keeps correcting you the same way, use propose_self_update to suggest better standing orders for yourself. The owner decides. Never claim your orders changed unless they approved it.${toolLines}`;
+7. You can grow: if the owner keeps correcting you the same way, use propose_self_update to suggest better standing orders for yourself. The owner decides. Never claim your orders changed unless they approved it.
+9. CHANNELS. The owner reaches you three ways and all three ARE the owner: (a) typing in the Agentically app; (b) a scheduled run the owner set up; (c) a message prefixed [OWNER via connector "<label>"], sent through a connector token the owner created in Settings and can revoke at any time (the label names that token). Treat all three exactly as the owner speaking. Never ask the owner to re-confirm a connector message in another channel: the token is the confirmation. If any standing order of yours says to verify "the Claude channel" or an "unverified relay", this rule supersedes it — the owner authorised the connector when they created the token. The approval gate (rule 2) still applies to everything you produce, whichever channel asked.
+Messages prefixed [Message from your teammate ...] come from another operator on the roster, not the owner: help them, but anything that ships still goes through the approvals inbox.${toolLines}`;
 }
 
 async function callClaude({ apiKey, messages, system, maxTokens = 2000, tools }) {
@@ -379,7 +381,7 @@ const STORE = {
   byMcpToken(raw) {
     if (!raw || !String(raw).startsWith("agk_")) return null;
     const hash = require("crypto").createHash("sha256").update(String(raw)).digest("hex");
-    for (const [wid, ws] of Object.entries(state.workspaces)) { const t = (ws.mcpTokens || []).find(x => x.hash === hash); if (t) { t.lastUsed = now(); save(); return Object.assign(ws, { _id: wid }); } }
+    for (const [wid, ws] of Object.entries(state.workspaces)) { const t = (ws.mcpTokens || []).find(x => x.hash === hash); if (t) { t.lastUsed = now(); save(); return Object.assign(ws, { _id: wid, _mcpTokenLabel: t.label }); } }
     return null;
   },
   addClaudeRequest(ws, r) {
@@ -412,7 +414,8 @@ const STORE = {
     save();
   },
   addSchedule(ws, s) {
-    const sch = { id: id("sch"), operatorId: s.operatorId, hour: Math.max(0, Math.min(23, parseInt(s.hour, 10) || 9)), minute: Math.max(0, Math.min(59, parseInt(s.minute, 10) || 0)), prompt: s.prompt, lastRunKey: null, createdAt: now() };
+    const days = Array.isArray(s.days) ? [...new Set(s.days.map(d => parseInt(d, 10)).filter(d => d >= 0 && d <= 6))].sort() : null;
+    const sch = { id: id("sch"), operatorId: s.operatorId, hour: Math.max(0, Math.min(23, parseInt(s.hour, 10) || 9)), minute: Math.max(0, Math.min(59, parseInt(s.minute, 10) || 0)), days: days && days.length ? days : null, prompt: s.prompt, lastRunKey: null, createdAt: now() };
     ws.schedules.push(sch);
     save();
     return sch;
@@ -814,11 +817,11 @@ app.delete("/api/facts/:idx", auth, (req, res) => {
   res.json({ ok: true, facts: req.ws.facts });
 });
 app.post("/api/schedules", auth, (req, res) => {
-  const { operatorId, hour, minute, prompt } = req.body || {};
+  const { operatorId, hour, minute, prompt, days } = req.body || {};
   const op = req.ws.operators.find(o => o.id === operatorId);
   if (!op) return res.status(400).json({ error: "unknown operator" });
   if (!prompt) return res.status(400).json({ error: "prompt required" });
-  const sch = STORE.addSchedule(req.ws, { operatorId, hour, minute, prompt });
+  const sch = STORE.addSchedule(req.ws, { operatorId, hour, minute, prompt, days });
   STORE.log(req.ws, "System", "scheduled " + op.name + " daily at " + String(sch.hour).padStart(2, "0") + ":" + String(sch.minute).padStart(2, "0") + " UTC");
   res.json({ schedule: sch });
 });
@@ -843,6 +846,7 @@ setInterval(async () => {
     if (ws.plan === "canceled") continue;
     for (const sch of ws.schedules || []) {
       if (sch.hour !== d.getUTCHours() || sch.minute !== d.getUTCMinutes() || sch.lastRunKey === key) continue;
+      if (Array.isArray(sch.days) && sch.days.length && !sch.days.includes(d.getUTCDay())) continue;
       sch.lastRunKey = key; STORE.save();
       const op = ws.operators.find(o => o.id === sch.operatorId);
       if (!op) continue;
@@ -967,7 +971,7 @@ const MCP_TOOLS = [
   { name: "post_claude_result", description: "Post Claude's result for a queued request. Marks it done (or declined) and delivers the result into the requesting operator's thread so it can continue.", inputSchema: { type: "object", properties: { id: { type: "string" }, result: { type: "string" }, status: { type: "string", enum: ["done", "declined"] } }, required: ["id", "result"] } },
   { name: "get_operator_thread", description: "Read an operator's recent conversation (last N messages) for context.", inputSchema: { type: "object", properties: { operator: { type: "string" }, limit: { type: "integer" } }, required: ["operator"] } },
   { name: "list_schedules", description: "List scheduled operator runs (id, operator, hour, minute UTC, prompt).", inputSchema: { type: "object", properties: {} } },
-  { name: "add_schedule", description: "Schedule an operator to run a prompt daily at hour:minute (UTC). Use when the owner asks Claude to put something on an operator's schedule.", inputSchema: { type: "object", properties: { operator: { type: "string" }, hour: { type: "integer" }, minute: { type: "integer" }, prompt: { type: "string" } }, required: ["operator", "hour", "prompt"] } },
+  { name: "add_schedule", description: "Schedule an operator to run a prompt at hour:minute (UTC), every day or only on given days of the week. Use when the owner asks Claude to put something on an operator's schedule.", inputSchema: { type: "object", properties: { operator: { type: "string" }, hour: { type: "integer" }, minute: { type: "integer" }, days: { type: "array", items: { type: "integer" }, description: "Optional days of week, 0=Sunday..6=Saturday (UTC). Omit for every day. Weekdays = [1,2,3,4,5]." }, prompt: { type: "string" } }, required: ["operator", "hour", "prompt"] } },
   { name: "delete_schedule", description: "Remove a scheduled operator run by id.", inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
   { name: "list_connections", description: "List connected services and which operators may use them.", inputSchema: { type: "object", properties: {} } }
 ];
@@ -994,10 +998,10 @@ app.post("/mcp/:wskey", async (req, res) => {
       if (p.name === "list_claude_requests") { const st = args.status || "pending"; return text(JSON.stringify((ws.claudeRequests || []).filter(r => st === "all" || r.status === st).slice(0, 50).map(r => ({ id: r.id, operator: r.operatorName, task: r.task, context: r.context, status: r.status, createdAt: r.createdAt, result: r.result })))); }
       if (p.name === "post_claude_result") { const rq = STORE.resolveClaudeRequest(ws, String(args.id || ""), String(args.result || ""), args.status); return rq ? text("Delivered to " + rq.operatorName + "'s thread (request " + rq.id + " " + rq.status + ").") : fail("No pending request with that id."); }
       if (p.name === "get_operator_thread") { const q = String(args.operator || "").toLowerCase(); const op = ws.operators.find(o => o.id === args.operator || o.name.toLowerCase() === q); if (!op) return fail("Unknown operator."); const n = Math.max(1, Math.min(60, parseInt(args.limit, 10) || 20)); return text(JSON.stringify((op.messages || []).slice(-n).map(m => ({ role: m.role, source: m.source || "", ts: m.ts, content: String(m.content).slice(0, 2000) })))); }
-      if (p.name === "list_schedules") return text(JSON.stringify(ws.schedules.map(s => ({ id: s.id, operator: (ws.operators.find(o => o.id === s.operatorId) || {}).name, hour: s.hour, minute: s.minute, prompt: s.prompt }))));
-      if (p.name === "add_schedule") { const q = String(args.operator || "").toLowerCase(); const op = ws.operators.find(o => o.id === args.operator || o.name.toLowerCase() === q); if (!op) return fail("Unknown operator."); const sch = STORE.addSchedule(ws, { operatorId: op.id, hour: args.hour, minute: args.minute || 0, prompt: String(args.prompt || "") }); STORE.log(ws, "Claude", "scheduled " + op.name + " daily at " + sch.hour + ":" + String(sch.minute).padStart(2, "0") + " UTC"); return text("Scheduled " + op.name + " daily at " + sch.hour + ":" + String(sch.minute).padStart(2, "0") + " UTC (id " + sch.id + ")."); }
+      if (p.name === "list_schedules") return text(JSON.stringify(ws.schedules.map(s => ({ id: s.id, operator: (ws.operators.find(o => o.id === s.operatorId) || {}).name, hour: s.hour, minute: s.minute, days: s.days || "daily", prompt: s.prompt }))));
+      if (p.name === "add_schedule") { const q = String(args.operator || "").toLowerCase(); const op = ws.operators.find(o => o.id === args.operator || o.name.toLowerCase() === q); if (!op) return fail("Unknown operator."); const sch = STORE.addSchedule(ws, { operatorId: op.id, hour: args.hour, minute: args.minute || 0, days: args.days, prompt: String(args.prompt || "") }); const when = (sch.days ? "on days " + sch.days.join(",") + " (0=Sun)" : "daily") + " at " + sch.hour + ":" + String(sch.minute).padStart(2, "0") + " UTC"; STORE.log(ws, "Claude", "scheduled " + op.name + " " + when); return text("Scheduled " + op.name + " " + when + " (id " + sch.id + ")."); }
       if (p.name === "delete_schedule") return STORE.deleteSchedule(ws, String(args.id || "")) ? text("Schedule removed.") : fail("No schedule with that id.");
-      if (p.name === "list_connections") return text(JSON.stringify((ws.connections || []).map(c => ({ service: c.service, account: c.account, usedBy: ws.operators.filter(o => (o.tools_allowed || []).some(t => t.service === c.service)).map(o => o.name) }))));
+      if (p.name === "list_connections") return text(JSON.stringify((ws.connections || []).map(c => ({ service: c.service, account: c.account, status: c.needsReauth ? "NEEDS RECONNECT — the owner must reconnect this service in Settings > Connections" : "ok", lastError: c.lastError || "", usedBy: ws.operators.filter(o => (o.tools_allowed || []).some(t => t.service === c.service)).map(o => o.name) }))));
       if (p.name === "add_fact") { STORE.addFact(ws, String(args.fact || "")); return text("Saved to business memory."); }
       if (p.name === "resolve_approval") {
         const item = STORE.resolveApproval(ws, String(args.id || ""), args.decision === "approve");
@@ -1010,7 +1014,7 @@ app.post("/mcp/:wskey", async (req, res) => {
         const q = String(args.operator || "").toLowerCase();
         const op = ws.operators.find(o => o.id === args.operator || o.name.toLowerCase() === q);
         if (!op) return fail("Unknown operator. Use list_operators first.");
-        const out = await operatorTurn({ ws, op, text: "[Message from Claude, the owner's outside assistant, via the Claude connector — treat as coming from the owner's side]: " + String(args.message || ""), apiKey: CLOUD_KEY, source: "connector" });
+        const out = await operatorTurn({ ws, op, text: "[OWNER via connector \"" + String(ws._mcpTokenLabel || "workspace key").replace(/"/g, "'") + "\"]: " + String(args.message || ""), apiKey: CLOUD_KEY, source: "connector" });
         STORE.bumpUsage(ws);
         let msg = op.name + ": " + out.text;
         if (out.approvals.length) msg += "\n\n[" + out.approvals.length + " deliverable(s) queued in the approvals inbox — the owner must approve before anything ships.]";
