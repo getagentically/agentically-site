@@ -139,12 +139,11 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
   }
 
   /* ---------- OAuth ---------- */
-  const pendingStates = new Map(); // state -> {wsKey, service, verifier, ts}
+  // Pending OAuth states live in the persisted store (STORE.oauthPending) so a redeploy mid-sign-in doesn't break the callback.
   function mkState(wsKey, service, extra) {
     const nonce = crypto.randomBytes(16).toString("base64url");
     const st = nonce + "." + sign(nonce + wsKey + service);
-    pendingStates.set(st, Object.assign({ wsKey, service, ts: Date.now() }, extra || {}));
-    for (const [k, v] of pendingStates) if (Date.now() - v.ts > 900000) pendingStates.delete(k);
+    STORE.oauthPending.set(st, Object.assign({ wsKey, service, ts: Date.now() }, extra || {}));
     return st;
   }
   const redirectFor = service => BASE_URL + "/oauth/" + service + "/callback";
@@ -215,9 +214,9 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
   }
 
   async function finishOAuth(service, code, stateStr, resolveWs) {
-    const st = pendingStates.get(stateStr);
-    if (!st || st.service !== service) throw new Error("bad state");
-    pendingStates.delete(stateStr);
+    const st = STORE.oauthPending.get(stateStr);
+    if (!st || st.service !== service || Date.now() - st.ts > 900000) throw new Error("bad state");
+    STORE.oauthPending.delete(stateStr);
     const ws = resolveWs(st.wsKey);
     if (!ws) throw new Error("workspace gone");
     const s = SERVICES[service];
@@ -710,11 +709,15 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
     "stripe:create_payment_link": "write", "stripe:create_customer": "write", "stripe:create_product": "write", "stripe:create_price": "write", "stripe:create_invoice": "write", "stripe:create_refund": "write", "stripe:finalize_invoice": "write", "stripe:cancel_subscription": "write", "stripe:update_subscription": "write", "stripe:create_coupon": "write",
     "vercel:deploy_to_vercel": "write"
   };
+  // Built-in services (gmail, drive, calendar…) declare readOnly themselves and are trusted.
+  // A remote MCP server's readOnlyHint is advisory only: a tool is treated as a read only when BOTH the hint and the name agree.
   function isWrite(service, tool) {
     const o = OVERRIDES[service + ":" + tool.name];
     if (o) return o === "write";
-    if (typeof tool.readOnly === "boolean" && tool.readOnly) return false;
-    return !READ_RE.test(tool.name);
+    const nameSaysRead = READ_RE.test(tool.name);
+    if ((SERVICES[service] || {}).type === "builtin" && typeof tool.readOnly === "boolean") return !tool.readOnly;
+    if (typeof tool.readOnly === "boolean" && tool.readOnly) return !nameSaysRead;
+    return !nameSaysRead;
   }
 
   /* ---------- tool exposure per operator ---------- */
@@ -765,9 +768,10 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
     if (!m) return { content: "Unknown tool.", is_error: true };
     const conn = wsConns(ws).find(c => c.id === m.connId);
     if (!conn) return { content: "That connection was removed.", is_error: true };
-    const policy = op.write_policy || "approve";
+    // Writes are either blocked ("none") or queued for the owner ("approve"). There is no auto mode: "It acts. You approve."
+    const policy = op.write_policy === "none" ? "none" : "approve";
     if (m.write && policy === "none") { audit(ws, { operator: op.name, service: m.service, tool: m.tool, args: argsHash(args), status: "blocked" }); return { content: "You are not allowed to perform write actions on " + m.service + ". Report what you would do and ask the owner.", is_error: true }; }
-    if (m.write && policy === "approve") {
+    if (m.write) {
       const item = STORE.addApproval(ws, {
         kind: "tool_call", operatorId: op.id, operatorName: op.name,
         title: summarize(m.service, m.tool, args),
@@ -825,16 +829,19 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
     adele: [{ service: "meta-ads" }], hugo: [{ service: "meta-ads" }], remy: [{ service: "meta-ads" }],
     rebecca: []
   };
-  function defaultScope(op) {
+  // The name-keyed defaults above are the FOUNDER roster's. A customer's operators start with no tool access
+  // and the owner grants services on /app/connections — never inherit another workspace's config by first name.
+  function defaultScope(op, ws) {
+    if (!ws || ws.plan !== "founder") return { tools_allowed: [], write_policy: "approve" };
     const k = String(op.name || "").toLowerCase().split(/\s/)[0];
     return { tools_allowed: DEFAULT_SCOPES[k] || [], write_policy: k === "chief" ? "none" : "approve" };
   }
   function ensureScopes(ws) {
     let changed = false;
     for (const op of ws.operators || []) {
-      if (!Array.isArray(op.tools_allowed)) { Object.assign(op, defaultScope(op)); changed = true; }
-      else { const d = defaultScope(op).tools_allowed; for (const t of d) if (!op.tools_allowed.some(x => x.service === t.service)) { op.tools_allowed.push(t); changed = true; } }
-      if (!op.write_policy) { op.write_policy = "approve"; changed = true; }
+      if (!Array.isArray(op.tools_allowed)) { Object.assign(op, defaultScope(op, ws)); changed = true; }
+      else if (ws.plan === "founder") { const d = defaultScope(op, ws).tools_allowed; for (const t of d) if (!op.tools_allowed.some(x => x.service === t.service)) { op.tools_allowed.push(t); changed = true; } }
+      if (op.write_policy !== "approve" && op.write_policy !== "none") { op.write_policy = "approve"; changed = true; } // migrates any stored "auto"
     }
     if (changed) STORE.save();
   }
@@ -842,7 +849,7 @@ module.exports = function makeConnections({ STORE, BASE_URL, PLANS }) {
     const op = ws.operators.find(o => o.id === opId);
     if (!op) return null;
     if (Array.isArray(patch.tools_allowed)) op.tools_allowed = patch.tools_allowed.filter(t => t && SERVICES[t.service]).map(t => ({ service: t.service, tools: Array.isArray(t.tools) ? t.tools.map(String).slice(0, 100) : ["*"] }));
-    if (["approve", "auto", "none"].includes(patch.write_policy)) op.write_policy = patch.write_policy;
+    if (["approve", "none"].includes(patch.write_policy)) op.write_policy = patch.write_policy;
     STORE.log(ws, "You", "updated " + op.name + "'s tool access");
     STORE.save();
     return op;
@@ -947,9 +954,9 @@ function render(){
   const tb=document.querySelector('#ops tbody');tb.innerHTML='';
   D.operators.forEach(o=>{const tr=document.createElement('tr');
     const cell=document.createElement('td');D.services.forEach(s=>{const on=o.tools_allowed.some(t=>t.service===s.id);const l=document.createElement('label');l.className='chk';const c=document.createElement('input');c.type='checkbox';c.checked=on;c.dataset.s=s.id;l.appendChild(c);l.appendChild(document.createTextNode(s.label));cell.appendChild(l)});
-    const pol=document.createElement('select');['approve','auto','none'].forEach(v=>{const op=document.createElement('option');op.value=v;op.textContent=v==='approve'?'approve first':v==='auto'?'auto (no approval)':'reads only';if(v===o.write_policy)op.selected=true;pol.appendChild(op)});
+    const pol=document.createElement('select');['approve','none'].forEach(v=>{const op=document.createElement('option');op.value=v;op.textContent=v==='approve'?'writes need your approval':'reads only';if(v===o.write_policy)op.selected=true;pol.appendChild(op)});
     const save=document.createElement('button');save.className='sec';save.textContent='Save';save.onclick=async()=>{const ta=[...cell.querySelectorAll('input:checked')].map(i=>({service:i.dataset.s,tools:(o.tools_allowed.find(t=>t.service===i.dataset.s)||{}).tools||['*']}));
-      if(pol.value==='auto'&&!confirm(o.name+' will run WRITE actions without asking you. Sure?'))return;await api('/operators/'+o.id+'/tools',{method:'PUT',body:{tools_allowed:ta,write_policy:pol.value}});load()};
+      await api('/operators/'+o.id+'/tools',{method:'PUT',body:{tools_allowed:ta,write_policy:pol.value}});load()};
     const n=document.createElement('td');n.innerHTML='<b>'+esc(o.name)+'</b><br><span class="note">'+esc(o.role)+'</span>';tr.appendChild(n);tr.appendChild(cell);const p=document.createElement('td');p.appendChild(pol);tr.appendChild(p);const sv2=document.createElement('td');sv2.appendChild(save);tr.appendChild(sv2);tb.appendChild(tr)});
   const ab=document.querySelector('#audit tbody');ab.innerHTML='';
   (D.audit||[]).forEach(a=>{const tr=document.createElement('tr');tr.innerHTML='<td>'+esc(new Date(a.ts).toLocaleString())+'</td><td>'+esc(a.operator)+'</td><td>'+esc(a.service+' / '+a.tool)+'</td><td>'+esc(a.status)+(a.error?' — '+esc(a.error):'')+'</td>';ab.appendChild(tr)});

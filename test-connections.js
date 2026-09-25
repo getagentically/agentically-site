@@ -77,8 +77,8 @@ const api = (p, o = {}) => new Promise((resolve, reject) => {
   // baseline chat: no connections -> exactly the 4 built-in tools
   claudeScript.push({ content: [{ type: "text", text: "hello" }] });
   const r0 = await api("/api/operators/" + opId + "/message", { body: { text: "hi" } });
-  assert.equal(r0.status, 200, r0.body); assert.deepEqual(seen.claudeTools.pop(), ["submit_for_approval", "remember_fact", "propose_self_update", "talk_to_teammate"]);
-  console.log("baseline 4 tools OK");
+  assert.equal(r0.status, 200, r0.body); assert.deepEqual(seen.claudeTools.pop(), ["submit_for_approval", "remember_fact", "propose_self_update", "request_claude", "talk_to_teammate"]);
+  console.log("baseline 5 tools OK");
   if (disabled) { console.log("DISABLED MODE PASS"); process.exit(0); }
 
   // connections page + catalog
